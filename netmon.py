@@ -8,6 +8,7 @@ Example:
 """
 import argparse
 import json
+import os
 import platform
 import re
 import signal
@@ -537,7 +538,7 @@ def get_arp_table():
 # ---------- monitor state ----------
 
 class Monitor:
-    def __init__(self, ips, workers):
+    def __init__(self, ips, workers, state_path=None):
         self.ips = ips
         self.workers = workers
         self.lock = threading.Lock()
@@ -547,6 +548,62 @@ class Monitor:
         self.scan_count = 0
         self.last_scan_duration = 0.0
         self.start_time = time.time()
+        self.state_path = state_path
+        if state_path:
+            self._load_state()
+
+    def _load_state(self):
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"warn: could not load state {self.state_path}: {e}", file=sys.stderr, flush=True)
+            return
+        devices = data.get("devices") or {}
+        events = data.get("events") or []
+        # Restore device records as-is (includes last_seen, present, etc.).
+        # On the next scan, devices that don't reply will be aged out by the normal
+        # leave-after-5min logic; devices that do reply just refresh silently.
+        with self.lock:
+            self.devices = devices
+            self.events = deque(events, maxlen=250)
+            saved_at = data.get("saved_at", "?")
+            online_was = sum(1 for d in devices.values() if d.get("present"))
+            marker = {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": "info",
+                "ip": "",
+                "mac": "",
+                "name": (f"--- restart: loaded {len(devices)} devices "
+                         f"({online_was} online) from state saved {saved_at} ---"),
+            }
+            self.events.appendleft(marker)
+        print(f"loaded {len(devices)} devices ({online_was} online), "
+              f"{len(events)} events from {self.state_path}", flush=True)
+
+    def _save_state(self):
+        if not self.state_path:
+            return
+        with self.lock:
+            devices_copy = {
+                ip: {**d, "names": list(d.get("names") or [])}
+                for ip, d in self.devices.items()
+            }
+            events_copy = list(self.events)
+        data = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "devices": devices_copy,
+            "events": events_copy,
+        }
+        tmp = self.state_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            print(f"warn: state save failed: {e}", file=sys.stderr, flush=True)
 
     def _emit(self, kind, ip, mac, name):
         ev = {
@@ -635,6 +692,8 @@ class Monitor:
         for ip, mac, names in departures:
             self._emit("left", ip, mac, " / ".join(names) if names else "")
 
+        self._save_state()
+
     def run(self, interval):
         while not self.stop_event.is_set():
             try:
@@ -642,6 +701,8 @@ class Monitor:
             except Exception as e:
                 print(f"scan error: {e!r}", file=sys.stderr, flush=True)
             self.stop_event.wait(interval)
+        # Final save on graceful stop.
+        self._save_state()
 
     def stop(self):
         self.stop_event.set()
@@ -724,6 +785,7 @@ tr:hover td { background: #181f26; }
 .ev { padding: 1px 0; white-space: pre; }
 .ev.arrived { color: #99c794; }
 .ev.left { color: #ec5f67; }
+.ev.info { color: #5fb3b3; font-style: italic; }
 .ev .t { color: #768390; }
 .muted { color: #768390; }
 </style></head>
@@ -858,7 +920,7 @@ async function refresh() {
   const evs = s.events;
   document.getElementById('evcount').textContent = `(${evs.length}/250, newest on top)`;
   document.getElementById('events').innerHTML = evs.map(e => {
-    const sym = e.kind === 'arrived' ? '+' : '-';
+    const sym = e.kind === 'arrived' ? '+' : (e.kind === 'left' ? '-' : '*');
     return `<div class="ev ${esc(e.kind)}"><span class="t">[${esc(e.time)}]</span> ${sym} ${esc(pad(e.ip, 15))}  ${esc(pad(e.mac, 17))}  ${esc(e.name)}</div>`;
   }).join('');
 }
@@ -909,6 +971,10 @@ def parse_args():
                    help="Concurrent ping workers (default 256)")
     p.add_argument("--bind", default="0.0.0.0",
                    help="HTTP bind address (default 0.0.0.0)")
+    p.add_argument("--state", default="netmon-state.json",
+                   help="Path to state cache file. Persists devices and event log "
+                        "across restarts so changes-during-downtime show up in the "
+                        "event panel. Set to '' to disable. (default: netmon-state.json)")
     return p.parse_args()
 
 
@@ -916,10 +982,12 @@ def main():
     args = parse_args()
     ips = ip_range(args.start, args.end)
     workers = min(args.workers, max(1, len(ips)))
-    monitor = Monitor(ips, workers)
+    state_path = args.state.strip() or None
+    monitor = Monitor(ips, workers, state_path=state_path)
 
     print(f"scanning {len(ips)} addresses {args.start} -> {args.end} "
-          f"with {workers} workers, interval {args.interval}s", flush=True)
+          f"with {workers} workers, interval {args.interval}s "
+          f"(state: {state_path or 'disabled'})", flush=True)
 
     scan_thread = threading.Thread(target=monitor.run, args=(args.interval,), daemon=True)
     scan_thread.start()
@@ -928,7 +996,7 @@ def main():
     print(f"dashboard:  http://{args.bind}:{args.port}/", flush=True)
 
     def shutdown(signum=None, frame=None):
-        print("\nshutting down…", flush=True)
+        print("\nshutting down...", flush=True)
         monitor.stop()
         try:
             server.shutdown()

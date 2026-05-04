@@ -6,3 +6,7 @@ venv/
 .idea/
 .vscode/
 .claude/settings.local.json
+
+# state cache file written by netmon at runtime
+netmon-state.json
+netmon-state.json.tmp
