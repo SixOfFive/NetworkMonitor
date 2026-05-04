@@ -224,6 +224,135 @@ def mdns_resolve(ip, timeout=0.6):
             pass
 
 
+# ---------- mDNS service enumeration (catches iPhones, iPads, Apple TVs,
+#            HomeKit, Chromecasts, AirPlay/Cast-enabled phones, etc.) ----------
+
+# Service types whose instance names tend to embed the device's friendly name
+# (e.g. "John's iPhone._companion-link._tcp.local").
+_MDNS_SERVICES = (
+    "_services._dns-sd._udp.local",     # meta: enumerate all advertised services
+    "_companion-link._tcp.local",        # iPhone, iPad, Apple Watch, Mac
+    "_homekit._tcp.local",               # HomeKit
+    "_airplay._tcp.local",               # Apple TV, AirPlay receivers
+    "_raop._tcp.local",                  # AirPlay audio
+    "_apple-mobdev2._tcp.local",         # iOS sync
+    "_rdlink._tcp.local",                # iOS Continuity
+    "_googlecast._tcp.local",            # Chromecast / Cast-enabled phones
+    "_googlezone._tcp.local",            # Google Home group
+    "_workstation._tcp.local",           # Linux/Avahi
+    "_device-info._tcp.local",
+    "_smb._tcp.local",
+    "_ssh._tcp.local",
+    "_printer._tcp.local",
+    "_ipp._tcp.local",
+    "_ipps._tcp.local",
+)
+
+
+def _parse_mdns_all_ptr_targets(data):
+    """Yield (qname, target) for every PTR record across answer/authority/additional sections."""
+    if len(data) < 12:
+        return
+    qd = int.from_bytes(data[4:6], "big")
+    an = int.from_bytes(data[6:8], "big")
+    ns = int.from_bytes(data[8:10], "big")
+    ar = int.from_bytes(data[10:12], "big")
+    offset = 12
+    for _ in range(qd):
+        _, offset = _decode_dns_name(data, offset)
+        if offset is None or offset + 4 > len(data):
+            return
+        offset += 4
+    for _ in range(an + ns + ar):
+        rname, offset = _decode_dns_name(data, offset)
+        if offset is None or offset + 10 > len(data):
+            return
+        rtype = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        offset += 2  # class
+        offset += 4  # ttl
+        rdlen = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        rdata_start = offset
+        if rtype == 12:  # PTR
+            target, _ = _decode_dns_name(data, offset)
+            if target:
+                yield (rname or "").rstrip("."), target.rstrip(".")
+        offset = rdata_start + rdlen
+
+
+def mdns_device_name(ip, timeout=1.0):
+    """Probe `ip` via mDNS service-type queries and extract a friendly device name."""
+    qcount = len(_MDNS_SERVICES)
+    header = (b"\x00\x00"
+              b"\x00\x00"
+              + qcount.to_bytes(2, "big")
+              + b"\x00\x00\x00\x00\x00\x00")
+    questions = b""
+    for svc in _MDNS_SERVICES:
+        questions += _encode_dns_name(svc) + b"\x00\x0c" + b"\x80\x01"
+    packet = header + questions
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        try:
+            sock.sendto(packet, (ip, 5353))
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            sock.sendto(packet, ("224.0.0.251", 5353))
+        except OSError:
+            pass
+
+        deadline = time.time() + timeout
+        seen_targets = []
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                data, addr = sock.recvfrom(8192)
+            except (socket.timeout, OSError):
+                break
+            if addr[0] != ip and addr[0] != "224.0.0.251":
+                continue
+            for _qname, target in _parse_mdns_all_ptr_targets(data):
+                if target and target not in seen_targets:
+                    seen_targets.append(target)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    # Pull instance names out of "instance._service._proto.local" targets.
+    candidates = []
+    for tgt in seen_targets:
+        low = tgt.lower()
+        # Strip well-known service suffixes to recover the human-readable instance name.
+        for svc in _MDNS_SERVICES:
+            suffix = "." + svc.lower()
+            if low.endswith(suffix) and len(tgt) > len(suffix):
+                instance = tgt[:-len(suffix)]
+                if instance and instance not in candidates:
+                    candidates.append(instance)
+                break
+        else:
+            # Bare hostname like "iPhone.local" — keep as-is.
+            if low.endswith(".local") and tgt.count(".") == 1:
+                if tgt not in candidates:
+                    candidates.append(tgt)
+
+    if not candidates:
+        return None
+    # Prefer the longest candidate (typically the friendly name vs an ID).
+    candidates.sort(key=lambda s: (-len(s), s.lower()))
+    return candidates[0]
+
+
 # ---------- minimal NetBIOS / WINS Node Status query (UDP 137) ----------
 
 def _nb_encode_name(name16):
@@ -365,7 +494,7 @@ def _name_is_useful(name):
 def resolve_names(ip):
     """Collect any names we can find for `ip`: reverse DNS + mDNS (Avahi/Bonjour) + NetBIOS/WINS."""
     names = []
-    for source in (resolve_hostname, mdns_resolve, nbns_name):
+    for source in (resolve_hostname, mdns_resolve, mdns_device_name, nbns_name):
         try:
             n = source(ip)
         except Exception:
