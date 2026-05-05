@@ -23,7 +23,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WINDOWS = platform.system().lower() == "windows"
-LEAVE_AFTER_SECONDS = 300
+LEAVE_AFTER_SECONDS = 300   # mark device as departed after this many seconds of silence
+STALE_AFTER_SECONDS = 30    # mark dot yellow if silent this long but not yet departed
 
 PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 MAC_RE = re.compile(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
@@ -506,11 +507,31 @@ def resolve_names(ip):
 
 
 def probe_one(ip, do_names=True):
+    """Probe an IP. Returns (ip, ping_ms_or_None, names, method).
+
+    method is "ping" if ICMP succeeded, "nbns" if discovered only via NetBIOS
+    Node Status (catches Windows hosts whose firewall drops ping but still has
+    File and Printer Sharing enabled), or None if no liveness signal at all.
+    """
     ms = ping_one(ip)
-    if ms is None:
-        return ip, None, []
-    names = resolve_names(ip) if do_names else []
-    return ip, ms, names
+    if ms is not None:
+        names = resolve_names(ip) if do_names else []
+        return ip, ms, names, "ping"
+    # Ping failed. Try NetBIOS — Windows hosts with the default firewall block
+    # ICMP echo but still respond to UDP/137 Node Status requests.
+    nbns = nbns_name(ip)
+    if not nbns or not _name_is_useful(nbns):
+        return ip, None, [], None
+    names = [nbns]
+    if do_names:
+        for src in (resolve_hostname, mdns_resolve, mdns_device_name):
+            try:
+                n = src(ip)
+            except Exception:
+                continue
+            if n and _name_is_useful(n) and n not in names:
+                names.append(n)
+    return ip, None, names, "nbns"
 
 
 def get_arp_table():
@@ -621,9 +642,9 @@ class Monitor:
 
     def scan_once(self):
         start = time.time()
-        responding = {}  # ip -> (ms, names_list)
+        responding = {}  # ip -> (ms_or_None, names_list, method)
 
-        # Fire all pings in parallel.
+        # Fire all probes in parallel.
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             # Skip name lookups for IPs we already have a name for; keep trying for the rest.
             with self.lock:
@@ -633,16 +654,16 @@ class Monitor:
                 for ip in self.ips
             ]
             for fut in as_completed(futures):
-                ip, ms, names = fut.result()
-                if ms is not None:
-                    responding[ip] = (ms, names)
+                ip, ms, names, method = fut.result()
+                if method:
+                    responding[ip] = (ms, names, method)
 
         arp = get_arp_table()
         now = time.time()
         arrivals, departures = [], []
 
         with self.lock:
-            for ip, (ms, names) in responding.items():
+            for ip, (ms, names, method) in responding.items():
                 mac = arp.get(ip)
                 d = self.devices.get(ip)
                 if d is None:
@@ -652,20 +673,24 @@ class Monitor:
                         "names": list(names),
                         "first_seen": now,
                         "last_seen": now,
+                        "last_recovered": now,   # treat first sighting as initial recovery
                         "last_ping_ms": ms,
-                        "total_ping_ms": ms,
-                        "ping_count": 1,
+                        "total_ping_ms": ms or 0.0,
+                        "ping_count": 1 if ms is not None else 0,
                         "present": True,
+                        "last_method": method,
                     }
                     self.devices[ip] = d
                     arrivals.append((ip, mac, list(names)))
                 else:
                     was_absent = not d["present"]
                     d["last_seen"] = now
-                    d["last_ping_ms"] = ms
-                    d["total_ping_ms"] += ms
-                    d["ping_count"] += 1
+                    if ms is not None:
+                        d["last_ping_ms"] = ms
+                        d["total_ping_ms"] = (d.get("total_ping_ms") or 0.0) + ms
+                        d["ping_count"] = (d.get("ping_count") or 0) + 1
                     d["present"] = True
+                    d["last_method"] = method
                     if mac and not d.get("mac"):
                         d["mac"] = mac
                     if names:
@@ -675,6 +700,7 @@ class Monitor:
                                 existing.append(n)
                         d["names"] = existing
                     if was_absent:
+                        d["last_recovered"] = now
                         arrivals.append((ip, d.get("mac"), list(d.get("names") or [])))
 
             # Departures: present devices not seen this scan, beyond grace window.
@@ -716,21 +742,35 @@ class Monitor:
             min_ping = min(ping_times) if ping_times else 0.0
             max_ping = max(ping_times) if ping_times else 0.0
 
+            stale_count = 0
             devices_out = []
             for d in sorted(self.devices.values(), key=lambda x: ip_to_int(x["ip"])):
-                avg = d["total_ping_ms"] / d["ping_count"] if d["ping_count"] else 0.0
+                pc = d.get("ping_count") or 0
+                avg = (d.get("total_ping_ms") or 0.0) / pc if pc else 0.0
                 names = d.get("names") or []
+                last_seen_ago = now - d["last_seen"]
+                if not d["present"]:
+                    state = "offline"
+                elif last_seen_ago > STALE_AFTER_SECONDS:
+                    state = "stale"
+                    stale_count += 1
+                else:
+                    state = "online"
+                lr = d.get("last_recovered") or d.get("first_seen")
                 devices_out.append({
                     "ip": d["ip"],
                     "mac": d.get("mac") or "",
                     "hostname": " / ".join(names),
                     "names": names,
                     "present": d["present"],
-                    "last_ping_ms": round(d["last_ping_ms"], 2) if d["last_ping_ms"] is not None else None,
+                    "state": state,
+                    "last_method": d.get("last_method") or "",
+                    "last_ping_ms": round(d["last_ping_ms"], 2) if d.get("last_ping_ms") is not None else None,
                     "avg_ping_ms": round(avg, 2),
-                    "ping_count": d["ping_count"],
-                    "last_seen_ago": round(now - d["last_seen"], 1),
+                    "ping_count": pc,
+                    "last_seen_ago": round(last_seen_ago, 1),
                     "first_seen": datetime.fromtimestamp(d["first_seen"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_recovered": datetime.fromtimestamp(lr).strftime("%Y-%m-%d %H:%M:%S") if lr else "",
                 })
 
             return {
@@ -738,7 +778,8 @@ class Monitor:
                 "events": list(self.events),
                 "stats": {
                     "total_known": len(self.devices),
-                    "online": len(online),
+                    "online": len(online) - stale_count,
+                    "stale": stale_count,
                     "offline": len(self.devices) - len(online),
                     "avg_ping_ms": round(avg_ping, 2),
                     "min_ping_ms": round(min_ping, 2),
@@ -750,6 +791,7 @@ class Monitor:
                     "range_start": self.ips[0],
                     "range_end": self.ips[-1],
                     "leave_after_s": LEAVE_AFTER_SECONDS,
+                    "stale_after_s": STALE_AFTER_SECONDS,
                 },
             }
 
@@ -779,8 +821,11 @@ th.sortable.active .arrow { color: #fac863; }
 tr:hover td { background: #181f26; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 .dot.on { background: #99c794; box-shadow: 0 0 6px #99c794aa; }
+.dot.stale { background: #fac863; box-shadow: 0 0 6px #fac86399; }
 .dot.off { background: #ec5f67; }
 .row-off td { color: #5a6470; }
+.row-stale td { color: #c8b075; }
+.via-nbns { color: #c594c5; font-size: 10px; margin-left: 4px; opacity: 0.85; }
 #events { background: #0d1218; border: 1px solid #232a32; border-radius: 4px; height: 250px; overflow-y: auto; padding: 6px 10px; font-size: 11px; }
 .ev { padding: 1px 0; white-space: pre; }
 .ev.arrived { color: #99c794; }
@@ -807,6 +852,7 @@ tr:hover td { background: #181f26; }
         <th class="sortable" data-sort="avg_ping_ms">Avg ping<span class="arrow"></span></th>
         <th class="sortable" data-sort="ping_count">Pings<span class="arrow"></span></th>
         <th class="sortable" data-sort="last_seen_ago">Last seen<span class="arrow"></span></th>
+        <th class="sortable" data-sort="last_recovered">Recovered<span class="arrow"></span></th>
         <th class="sortable" data-sort="first_seen">First seen<span class="arrow"></span></th>
       </tr></thead>
       <tbody id="devices"></tbody>
@@ -887,10 +933,11 @@ async function refresh() {
   }
   const st = s.stats;
   document.getElementById('sub').textContent =
-    `range ${st.range_start} – ${st.range_end} (${st.range_size} addresses) · scan #${st.scan_count} took ${st.last_scan_duration}s · uptime ${st.uptime_seconds}s · leave-after ${st.leave_after_s}s`;
+    `range ${st.range_start} – ${st.range_end} (${st.range_size} addresses) · scan #${st.scan_count} took ${st.last_scan_duration}s · uptime ${st.uptime_seconds}s · stale-after ${st.stale_after_s}s · leave-after ${st.leave_after_s}s`;
 
   const cards = [
     ['Online now',     st.online],
+    ['Stale',          st.stale],
     ['Known total',    st.total_known],
     ['Offline',        st.offline],
     ['Avg ping (ms)',  st.avg_ping_ms],
@@ -904,18 +951,27 @@ async function refresh() {
     .join('');
 
   paintHeaderArrows();
-  document.getElementById('devices').innerHTML = sortDevices(s.devices).map(d => `
-    <tr class="${d.present ? '' : 'row-off'}">
-      <td><span class="dot ${d.present ? 'on' : 'off'}"></span></td>
+  document.getElementById('devices').innerHTML = sortDevices(s.devices).map(d => {
+    const dotCls = d.state === 'online' ? 'on' : (d.state === 'stale' ? 'stale' : 'off');
+    const rowCls = d.state === 'online' ? '' : (d.state === 'stale' ? 'row-stale' : 'row-off');
+    const viaTag = d.last_method === 'nbns' ? '<span class="via-nbns">[NBNS]</span>' : '';
+    const pingCell = d.last_ping_ms !== null
+      ? esc(d.last_ping_ms) + ' ms' + viaTag
+      : (d.last_method === 'nbns' ? '<span class="muted">no ICMP</span>' + viaTag : '<span class="muted">—</span>');
+    return `
+    <tr class="${rowCls}">
+      <td><span class="dot ${dotCls}"></span></td>
       <td>${esc(d.ip)}</td>
       <td>${esc(d.mac) || '<span class="muted">—</span>'}</td>
       <td>${esc(d.hostname) || '<span class="muted">—</span>'}</td>
-      <td>${d.last_ping_ms !== null ? esc(d.last_ping_ms) + ' ms' : '<span class="muted">—</span>'}</td>
+      <td>${pingCell}</td>
       <td>${esc(d.avg_ping_ms)} ms</td>
       <td>${esc(d.ping_count)}</td>
       <td>${esc(d.last_seen_ago)}s ago</td>
+      <td>${esc(d.last_recovered)}</td>
       <td>${esc(d.first_seen)}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 
   const evs = s.events;
   document.getElementById('evcount').textContent = `(${evs.length}/250, newest on top)`;
