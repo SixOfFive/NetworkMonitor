@@ -506,32 +506,72 @@ def resolve_names(ip):
     return names
 
 
+def tcp_alive(ip, ports=(445, 135, 22, 3389), timeout=0.35):
+    """Quick TCP-connect probe to common always-on Windows/Linux ports.
+    Returns True if any port accepts a connection (i.e. the host is up)."""
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            if s.connect_ex((ip, port)) == 0:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+                return True
+        except OSError:
+            pass
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return False
+
+
+def _gather_names(ip):
+    """Try every name source we have, return de-duped useful names."""
+    names = []
+    for src in (resolve_hostname, mdns_resolve, mdns_device_name, nbns_name):
+        try:
+            n = src(ip)
+        except Exception:
+            continue
+        if n and _name_is_useful(n) and n not in names:
+            names.append(n)
+    return names
+
+
 def probe_one(ip, do_names=True):
     """Probe an IP. Returns (ip, ping_ms_or_None, names, method).
 
-    method is "ping" if ICMP succeeded, "nbns" if discovered only via NetBIOS
-    Node Status (catches Windows hosts whose firewall drops ping but still has
-    File and Printer Sharing enabled), or None if no liveness signal at all.
+    Method:
+      "ping" - ICMP succeeded (best — gives RTT and confirms reachability).
+      "nbns" - ICMP failed but NetBIOS Node Status answered (legacy Windows /
+               Samba — also gives us the workstation name for free).
+      "tcp"  - ICMP+NBNS both failed but a common service port (SMB/RPC/SSH/RDP)
+               accepted a connection. Catches modern Windows hosts that block
+               ICMP and have NetBIOS-over-TCP disabled but still expose SMB.
+      None   - no signal at all.
     """
     ms = ping_one(ip)
     if ms is not None:
         names = resolve_names(ip) if do_names else []
         return ip, ms, names, "ping"
-    # Ping failed. Try NetBIOS — Windows hosts with the default firewall block
-    # ICMP echo but still respond to UDP/137 Node Status requests.
+    # Ping failed — try NetBIOS Node Status first (cheap UDP, also gets a name).
     nbns = nbns_name(ip)
-    if not nbns or not _name_is_useful(nbns):
-        return ip, None, [], None
-    names = [nbns]
-    if do_names:
-        for src in (resolve_hostname, mdns_resolve, mdns_device_name):
-            try:
-                n = src(ip)
-            except Exception:
-                continue
-            if n and _name_is_useful(n) and n not in names:
-                names.append(n)
-    return ip, None, names, "nbns"
+    if nbns and _name_is_useful(nbns):
+        names = [nbns]
+        if do_names:
+            for n in _gather_names(ip):
+                if n not in names:
+                    names.append(n)
+        return ip, None, names, "nbns"
+    # NBNS silent too — try a TCP probe on a few well-known ports.
+    if tcp_alive(ip):
+        names = _gather_names(ip) if do_names else []
+        return ip, None, names, "tcp"
+    return ip, None, [], None
 
 
 def get_arp_table():
@@ -825,7 +865,9 @@ tr:hover td { background: #181f26; }
 .dot.off { background: #ec5f67; }
 .row-off td { color: #5a6470; }
 .row-stale td { color: #c8b075; }
-.via-nbns { color: #c594c5; font-size: 10px; margin-left: 4px; opacity: 0.85; }
+.via-tag  { font-size: 10px; margin-left: 4px; opacity: 0.85; }
+.via-nbns { color: #c594c5; }
+.via-tcp  { color: #6699cc; }
 #events { background: #0d1218; border: 1px solid #232a32; border-radius: 4px; height: 250px; overflow-y: auto; padding: 6px 10px; font-size: 11px; }
 .ev { padding: 1px 0; white-space: pre; }
 .ev.arrived { color: #99c794; }
@@ -954,10 +996,12 @@ async function refresh() {
   document.getElementById('devices').innerHTML = sortDevices(s.devices).map(d => {
     const dotCls = d.state === 'online' ? 'on' : (d.state === 'stale' ? 'stale' : 'off');
     const rowCls = d.state === 'online' ? '' : (d.state === 'stale' ? 'row-stale' : 'row-off');
-    const viaTag = d.last_method === 'nbns' ? '<span class="via-nbns">[NBNS]</span>' : '';
+    let viaTag = '';
+    if (d.last_method === 'nbns') viaTag = '<span class="via-tag via-nbns">[NBNS]</span>';
+    else if (d.last_method === 'tcp')  viaTag = '<span class="via-tag via-tcp">[TCP]</span>';
     const pingCell = d.last_ping_ms !== null
       ? esc(d.last_ping_ms) + ' ms' + viaTag
-      : (d.last_method === 'nbns' ? '<span class="muted">no ICMP</span>' + viaTag : '<span class="muted">—</span>');
+      : (viaTag ? '<span class="muted">no ICMP</span>' + viaTag : '<span class="muted">—</span>');
     return `
     <tr class="${rowCls}">
       <td><span class="dot ${dotCls}"></span></td>
