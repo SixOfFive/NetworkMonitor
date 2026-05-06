@@ -575,25 +575,42 @@ def probe_one(ip, do_names=True):
 
 
 def get_arp_table():
-    cmd = ["arp", "-a"] if IS_WINDOWS else ["arp", "-n"]
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=8, **_popen_kwargs(),
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return {}
-    table = {}
-    for line in result.stdout.decode("utf-8", errors="ignore").splitlines():
-        ip_m = IP_RE.search(line)
-        mac_m = MAC_RE.search(line)
-        if not (ip_m and mac_m):
+    """Return {ip: mac} from the OS neighbor cache.
+
+    Tries `ip neigh show` first (modern Linux — net-tools is no longer in the
+    base install on Debian 13+, so legacy `arp` may be missing), then falls
+    back to `arp -n` / `arp -a`. Output of all three is line-based with an IP
+    and MAC token per row, which our regexes pick up uniformly.
+    """
+    if IS_WINDOWS:
+        commands = [["arp", "-a"]]
+    else:
+        commands = [["ip", "neigh", "show"], ["arp", "-n"]]
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=8, **_popen_kwargs(),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             continue
-        mac = mac_m.group(0).lower().replace("-", ":")
-        if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        if result.returncode != 0:
             continue
-        table[ip_m.group(0)] = mac
-    return table
+        out = result.stdout.decode("utf-8", errors="ignore")
+        if not out.strip():
+            continue
+        table = {}
+        for line in out.splitlines():
+            ip_m = IP_RE.search(line)
+            mac_m = MAC_RE.search(line)
+            if not (ip_m and mac_m):
+                continue
+            mac = mac_m.group(0).lower().replace("-", ":")
+            if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                continue
+            table[ip_m.group(0)] = mac
+        return table
+    return {}
 
 
 # ---------- monitor state ----------
