@@ -1471,7 +1471,8 @@ async function openMacModal(mac) {
     ? data.ip_changes.slice().reverse().map(c => {
         const cprev = ipColors[c[1]] || '#fac863';
         const cnew  = ipColors[c[2]] || '#fac863';
-        return `<div class="row">${fmtTs(c[0])}  <span style="color:${cprev}">${esc(c[1])}</span>  →  <span style="color:${cnew}">${esc(c[2])}</span></div>`;
+        // Stripe matches the *new* IP — that's the row's "destination" color.
+        return `<div class="row" style="border-left:3px solid ${cnew};padding-left:6px;color:#c0c5ce;">${fmtTs(c[0])}  <span style="color:${cprev};font-weight:600">${esc(c[1])}</span>  →  <span style="color:${cnew};font-weight:600">${esc(c[2])}</span></div>`;
       }).join('')
     : '<div class="muted">No IP changes recorded.</div>';
   // All samples in the window, newest first, color-matched to the chart.
@@ -1481,7 +1482,7 @@ async function openMacModal(mac) {
   document.getElementById('modal-samples').innerHTML = samplesNewestFirst.length
     ? samplesNewestFirst.map(s => {
         const c = ipColors[s[2]] || '#c0c5ce';
-        return `<div class="row" style="color:${c}">${fmtTs(s[0])}  ${esc(s[2])}  ${s[1].toFixed(2)} ms</div>`;
+        return `<div class="row" style="border-left:3px solid ${c};padding-left:6px;color:#c0c5ce;">${fmtTs(s[0])}  <span style="color:${c};font-weight:600">${esc(s[2])}</span>  ${s[1].toFixed(2)} ms</div>`;
       }).join('')
     : '<div class="muted">no samples</div>';
   document.getElementById('modal-backdrop').classList.add('open');
