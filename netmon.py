@@ -1368,10 +1368,33 @@ function renderChart(samples, ipChanges, ipColors) {
   const xOf = t => padL + (t - tMin) / tRange * (W - padL - padR);
   const yOf = m => padT + (1 - m / msMax) * (H - padT - padB);
 
-  const points = samples.map(s => `${xOf(s[0]).toFixed(1)},${yOf(s[1]).toFixed(1)}`).join(' ');
+  // Build line segments grouped by IP color so the trace changes color when
+  // the device's IP changes — matches the chip and dot colors for "IPs seen".
+  // Each transition between IPs starts a new segment that includes the previous
+  // point as its first vertex, so the segments visually connect.
+  const segments = [];
+  let curColor = null, curPts = null;
+  samples.forEach(s => {
+    const pt = `${xOf(s[0]).toFixed(1)},${yOf(s[1]).toFixed(1)}`;
+    const c = ipColors[s[2]] || '#5fb3b3';
+    if (curColor === null) {
+      curColor = c; curPts = [pt];
+    } else if (c === curColor) {
+      curPts.push(pt);
+    } else {
+      segments.push({ color: curColor, pts: curPts });
+      // bridge across the boundary so there's no visual gap
+      curPts = [curPts[curPts.length - 1], pt];
+      curColor = c;
+    }
+  });
+  if (curPts) segments.push({ color: curColor, pts: curPts });
+  const lines = segments.map(seg =>
+    `<polyline points="${seg.pts.join(' ')}" fill="none" stroke="${seg.color}" stroke-width="1.4" opacity="0.75"/>`
+  ).join('');
   const dots = samples.map(s => {
     const c = ipColors[s[2]] || '#5fb3b3';
-    return `<circle cx="${xOf(s[0]).toFixed(1)}" cy="${yOf(s[1]).toFixed(1)}" r="1.6" fill="${c}"/>`;
+    return `<circle cx="${xOf(s[0]).toFixed(1)}" cy="${yOf(s[1]).toFixed(1)}" r="2" fill="${c}"/>`;
   }).join('');
 
   // Vertical dashed lines at IP changes — color-match the new IP.
@@ -1408,7 +1431,7 @@ function renderChart(samples, ipChanges, ipColors) {
       ${yTicks}
       ${xTicks}
       ${ipLines}
-      <polyline points="${points}" fill="none" stroke="#5fb3b3" stroke-width="1" opacity="0.35"/>
+      ${lines}
       ${dots}
     </svg>
   `;
