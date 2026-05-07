@@ -574,18 +574,89 @@ def probe_one(ip, do_names=True):
     return ip, None, [], None
 
 
+def _get_local_macs():
+    """Return {ip: mac} for IPs assigned to local interfaces.
+
+    The OS neighbor cache (`ip neigh` / `arp`) does NOT contain entries for the
+    host's own IPs — the kernel never ARPs itself — so without this the local
+    machine appears in the dashboard with a blank MAC. We ask the OS directly
+    via `ip -j addr show` (Linux) or `ipconfig /all` (Windows).
+    """
+    result = {}
+    if IS_WINDOWS:
+        try:
+            out = subprocess.run(
+                ["ipconfig", "/all"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5, **_popen_kwargs(),
+            ).stdout.decode("utf-8", errors="ignore")
+        except (subprocess.TimeoutExpired, OSError):
+            return result
+        current_mac = None
+        for line in out.splitlines():
+            mac_m = re.search(r"Physical Address[^:]*:\s*([0-9A-Fa-f-]{17})", line)
+            if mac_m:
+                current_mac = mac_m.group(1).lower().replace("-", ":")
+                continue
+            ip_m = re.search(r"IPv4 Address[^:]*:\s*((?:\d{1,3}\.){3}\d{1,3})", line)
+            if ip_m and current_mac:
+                result[ip_m.group(1)] = current_mac
+        return result
+    # Linux: prefer JSON output of iproute2 (Debian 11+ ships it).
+    try:
+        out = subprocess.run(
+            ["ip", "-j", "addr", "show"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).stdout.decode("utf-8", errors="ignore")
+        for iface in json.loads(out):
+            mac = (iface.get("address") or "").lower()
+            if not mac or mac == "00:00:00:00:00:00":
+                continue
+            for addr in iface.get("addr_info") or []:
+                if addr.get("family") == "inet":
+                    ip = addr.get("local")
+                    if ip:
+                        result[ip] = mac
+        if result:
+            return result
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError, TypeError):
+        pass
+    # Fallback: text output of `ip addr show`.
+    try:
+        out = subprocess.run(
+            ["ip", "addr", "show"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).stdout.decode("utf-8", errors="ignore")
+    except (subprocess.TimeoutExpired, OSError):
+        return result
+    current_mac = None
+    for raw in out.splitlines():
+        stripped = raw.strip()
+        m = re.match(r"link/ether\s+([0-9a-f:]{17})", stripped)
+        if m:
+            current_mac = m.group(1)
+            continue
+        m = re.match(r"inet\s+((?:\d{1,3}\.){3}\d{1,3})", stripped)
+        if m and current_mac:
+            result[m.group(1)] = current_mac
+    return result
+
+
 def get_arp_table():
-    """Return {ip: mac} from the OS neighbor cache.
+    """Return {ip: mac} from the OS neighbor cache, plus the host's own IPs.
 
     Tries `ip neigh show` first (modern Linux — net-tools is no longer in the
     base install on Debian 13+, so legacy `arp` may be missing), then falls
-    back to `arp -n` / `arp -a`. Output of all three is line-based with an IP
-    and MAC token per row, which our regexes pick up uniformly.
+    back to `arp -n` / `arp -a`. Local interface IPs are added separately via
+    `_get_local_macs()` since the neighbor cache never contains them.
     """
     if IS_WINDOWS:
         commands = [["arp", "-a"]]
     else:
         commands = [["ip", "neigh", "show"], ["arp", "-n"]]
+    table = {}
     for cmd in commands:
         try:
             result = subprocess.run(
@@ -599,7 +670,6 @@ def get_arp_table():
         out = result.stdout.decode("utf-8", errors="ignore")
         if not out.strip():
             continue
-        table = {}
         for line in out.splitlines():
             ip_m = IP_RE.search(line)
             mac_m = MAC_RE.search(line)
@@ -609,8 +679,11 @@ def get_arp_table():
             if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                 continue
             table[ip_m.group(0)] = mac
-        return table
-    return {}
+        break  # first successful command wins
+    # Layer in local interface MACs — these never appear in the neighbor cache.
+    for ip, mac in _get_local_macs().items():
+        table.setdefault(ip, mac)
+    return table
 
 
 # ---------- monitor state ----------
