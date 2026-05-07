@@ -1149,7 +1149,9 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
 .modal-close:hover { color: #ff7a82; }
 .modal-meta { font-size: 11px; color: #c0c5ce; margin: 8px 0 12px; line-height: 1.6; }
 .modal-meta .label { color: #768390; display: inline-block; min-width: 90px; }
-.modal-meta .ipchip { background: #1a2129; padding: 1px 6px; border-radius: 3px; margin-right: 4px; font-size: 10px; border: 1px solid transparent; }
+.modal-meta .ipchip { background: #1a2129; padding: 1px 6px; border-radius: 3px; margin-right: 4px; font-size: 10px; border: 1px solid transparent; cursor: pointer; user-select: none; }
+.modal-meta .ipchip:hover { filter: brightness(1.4); }
+.modal-meta .ipchip.selected { background: rgba(255,255,255,0.08); }
 .chart-svg { background: #0d1218; display: block; border: 1px solid #232a32; border-radius: 3px; }
 .modal-section h3 { font-size: 11px; color: #fac863; text-transform: uppercase; letter-spacing: 0.5px; margin: 14px 0 6px; }
 .modal-table { font-size: 11px; max-height: 200px; overflow-y: auto; background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 6px 10px; }
@@ -1449,6 +1451,11 @@ function renderChart(samples, ipChanges, ipColors) {
   `;
 }
 
+// Modal state. currentMacData holds the full unfiltered fetch; selectedIp,
+// when set, narrows the chart / IP-changes / samples list to that one IP.
+let currentMacData = null;
+let selectedIp = null;
+
 async function openMacModal(mac) {
   if (!mac) return;
   let data;
@@ -1460,44 +1467,64 @@ async function openMacModal(mac) {
     alert('Could not load history for ' + mac);
     return;
   }
-  document.getElementById('modal-mac').textContent = data.mac;
+  currentMacData = data;
+  selectedIp = null;
+  renderMacModal();
+  document.getElementById('modal-backdrop').classList.add('open');
+}
+
+function renderMacModal() {
+  if (!currentMacData) return;
+  const data = currentMacData;
+  const sel = selectedIp;
   const ipColors = buildIpColors(data);
+
+  // Apply IP filter to samples and ip_changes if one is selected.
+  const samples = sel ? data.samples.filter(s => s[2] === sel) : data.samples;
+  const ipChanges = sel
+    ? data.ip_changes.filter(c => c[1] === sel || c[2] === sel)
+    : data.ip_changes;
+
+  document.getElementById('modal-mac').textContent = data.mac;
+
   const chipFor = ip => {
     const color = ipColors[ip] || '#5fb3b3';
     const isCurrent = ip === data.current_ip;
-    const style = isCurrent
-      ? `color:${color};border:1px solid ${color};`
-      : `color:${color};`;
-    return `<span class="ipchip" style="${style}">${esc(ip)}${isCurrent ? ' (current)' : ''}</span>`;
+    const isSelected = ip === sel;
+    let style = `color:${color};`;
+    if (isCurrent) style += `border-color:${color};`;
+    const cls = 'ipchip' + (isSelected ? ' selected' : '');
+    const label = esc(ip) + (isCurrent ? ' (current)' : '');
+    return `<span class="${cls}" data-ip="${esc(ip)}" style="${style}" title="Click to filter chart to this IP">${label}</span>`;
   };
   const ipChips = data.ips.map(chipFor).join('');
   const windowH = Math.round((data.window_seconds || 86400) / 3600);
+  const filterNote = sel
+    ? `<span class="muted"> · filter: <span style="color:${ipColors[sel] || '#fac863'}">${esc(sel)}</span> only — click chip again to clear</span>`
+    : '<span class="muted"> · click any chip to filter</span>';
   document.getElementById('modal-meta').innerHTML = `
     <div><span class="label">Names:</span> ${esc(data.names.join(' / ')) || '<span class="muted">—</span>'}</div>
     <div><span class="label">State:</span> ${esc(data.current_state || 'unknown')}</div>
-    <div><span class="label">IPs seen:</span> ${ipChips || '<span class="muted">—</span>'}</div>
-    <div><span class="label">Samples:</span> ${data.samples.length} · IP changes: ${data.ip_changes.length} · window: last ${windowH}h</div>
+    <div><span class="label">IPs seen:</span> ${ipChips || '<span class="muted">—</span>'}${filterNote}</div>
+    <div><span class="label">Samples:</span> ${samples.length}${sel ? ` of ${data.samples.length}` : ''} · IP changes: ${ipChanges.length}${sel ? ` of ${data.ip_changes.length}` : ''} · window: last ${windowH}h</div>
   `;
-  document.getElementById('modal-chart').innerHTML = renderChart(data.samples, data.ip_changes, ipColors);
-  document.getElementById('modal-ipchanges').innerHTML = data.ip_changes.length
-    ? data.ip_changes.slice().reverse().map(c => {
+  document.getElementById('modal-chart').innerHTML = renderChart(samples, ipChanges, ipColors);
+  document.getElementById('modal-ipchanges').innerHTML = ipChanges.length
+    ? ipChanges.slice().reverse().map(c => {
         const cprev = ipColors[c[1]] || '#fac863';
         const cnew  = ipColors[c[2]] || '#fac863';
-        // Stripe matches the *new* IP — that's the row's "destination" color.
         return `<div class="row" style="border-left:3px solid ${cnew};padding-left:6px;color:#c0c5ce;">${fmtTs(c[0])}  <span style="color:${cprev};font-weight:600">${esc(c[1])}</span>  →  <span style="color:${cnew};font-weight:600">${esc(c[2])}</span></div>`;
       }).join('')
-    : '<div class="muted">No IP changes recorded.</div>';
-  // All samples in the window, newest first, color-matched to the chart.
-  const samplesNewestFirst = data.samples.slice().reverse();
+    : `<div class="muted">${sel ? 'No IP changes involve ' + esc(sel) + '.' : 'No IP changes recorded.'}</div>`;
+  const samplesNewestFirst = samples.slice().reverse();
   document.getElementById('modal-samples-count').textContent =
-    `(${samplesNewestFirst.length} samples in last ${windowH}h)`;
+    `(${samplesNewestFirst.length}${sel ? ` of ${data.samples.length}` : ''} samples in last ${windowH}h${sel ? `, filtered to ${sel}` : ''})`;
   document.getElementById('modal-samples').innerHTML = samplesNewestFirst.length
     ? samplesNewestFirst.map(s => {
         const c = ipColors[s[2]] || '#c0c5ce';
         return `<div class="row" style="border-left:3px solid ${c};padding-left:6px;color:#c0c5ce;">${fmtTs(s[0])}  <span style="color:${c};font-weight:600">${esc(s[2])}</span>  ${s[1].toFixed(2)} ms</div>`;
       }).join('')
-    : '<div class="muted">no samples</div>';
-  document.getElementById('modal-backdrop').classList.add('open');
+    : `<div class="muted">${sel ? 'No samples for ' + esc(sel) + '.' : 'no samples'}</div>`;
 }
 
 function closeMacModal() {
@@ -1513,6 +1540,15 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMacMo
 document.addEventListener('click', (e) => {
   // Don't intercept clicks on the sortable headers (already handled).
   if (e.target.closest('th.sortable')) return;
+  // IP chip inside the modal — toggle the per-IP filter.
+  const chip = e.target.closest('.modal-meta .ipchip[data-ip]');
+  if (chip) {
+    e.stopPropagation();   // don't bubble through the backdrop close handler
+    const ip = chip.dataset.ip;
+    selectedIp = (selectedIp === ip) ? null : ip;
+    renderMacModal();
+    return;
+  }
   const tr = e.target.closest('tr[data-mac]');
   if (tr) {
     e.preventDefault();
