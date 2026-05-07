@@ -26,7 +26,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 IS_WINDOWS = platform.system().lower() == "windows"
 LEAVE_AFTER_SECONDS = 300       # mark device as departed after this many seconds of silence
 STALE_AFTER_SECONDS = 30        # mark dot yellow if silent this long but not yet departed
-PING_HISTORY_MAXLEN = 1800      # per-MAC ping samples kept (1800 = 30 min @ 1Hz)
+MAC_SAMPLE_INTERVAL_S = 30      # only append one ping sample per MAC every N seconds
+PING_HISTORY_MAXLEN = 2880      # per-MAC ping samples kept (2880 × 30s = 24h)
+PING_HISTORY_WINDOW_S = 86400   # only show samples newer than this in the chart (24h)
 IP_CHANGES_MAXLEN = 64          # per-MAC IP change events kept
 
 PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
@@ -706,12 +708,25 @@ class Monitor:
         self.last_scan_duration = 0.0
         self.start_time = time.time()
         self.state_path = state_path
+        # Per-MAC ping history lives in a sidecar file so the per-scan state save
+        # stays small and fast. Only written on graceful shutdown — losing the
+        # last 24h of chart history on a crash is acceptable; the device list and
+        # event log (which DO save every scan) are what matter for restart recovery.
+        self.history_path = (state_path + ".history.json"
+                             if state_path and not state_path.endswith(".history.json")
+                             else None)
         if state_path:
             self._load_state()
 
     def _record_ping(self, mac, ts, ms, ip):
         """Append a ping sample to a MAC's history; record an IP-change event if
-        this MAC's most recent IP differs from the new one. Caller holds self.lock."""
+        this MAC's most recent IP differs from the new one.
+
+        Sampling is throttled to once per MAC_SAMPLE_INTERVAL_S so that 24h of
+        history fits in PING_HISTORY_MAXLEN entries. IP-change detection bypasses
+        the throttle (we always record a sample on the change boundary so the
+        chart's vertical marker lines up with reality). Caller holds self.lock.
+        """
         if not mac or ms is None:
             return
         h = self.mac_history.get(mac)
@@ -720,9 +735,14 @@ class Monitor:
                 "samples": deque(maxlen=PING_HISTORY_MAXLEN),
                 "ip_changes": [],
             }
-        prev_ip = h["samples"][-1][2] if h["samples"] else None
+        prev = h["samples"][-1] if h["samples"] else None
+        prev_ip = prev[2] if prev else None
+        ip_changed = prev_ip is not None and prev_ip != ip
+        # Throttle except on IP-change boundaries (always record those).
+        if not ip_changed and prev is not None and (ts - prev[0]) < MAC_SAMPLE_INTERVAL_S:
+            return
         h["samples"].append((ts, ms, ip))
-        if prev_ip and prev_ip != ip:
+        if ip_changed:
             h["ip_changes"].append((ts, prev_ip, ip))
             if len(h["ip_changes"]) > IP_CHANGES_MAXLEN:
                 h["ip_changes"] = h["ip_changes"][-IP_CHANGES_MAXLEN:]
@@ -738,19 +758,31 @@ class Monitor:
             return
         devices = data.get("devices") or {}
         events = data.get("events") or []
-        mac_history = data.get("mac_history") or {}
         # Restore device records as-is (includes last_seen, present, etc.).
         # On the next scan, devices that don't reply will be aged out by the normal
         # leave-after-5min logic; devices that do reply just refresh silently.
         with self.lock:
             self.devices = devices
             self.events = deque(events, maxlen=250)
-            self.mac_history = {}
-            for mac, h in mac_history.items():
-                self.mac_history[mac] = {
-                    "samples": deque(h.get("samples") or [], maxlen=PING_HISTORY_MAXLEN),
-                    "ip_changes": h.get("ip_changes") or [],
-                }
+        # Sidecar mac_history file (only written on graceful shutdown).
+        if self.history_path:
+            try:
+                with open(self.history_path, encoding="utf-8") as f:
+                    hist = json.load(f)
+            except FileNotFoundError:
+                hist = {}
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"warn: could not load history {self.history_path}: {e}",
+                      file=sys.stderr, flush=True)
+                hist = {}
+            mac_history = hist.get("mac_history") or {}
+            with self.lock:
+                self.mac_history = {}
+                for mac, h in mac_history.items():
+                    self.mac_history[mac] = {
+                        "samples": deque(h.get("samples") or [], maxlen=PING_HISTORY_MAXLEN),
+                        "ip_changes": h.get("ip_changes") or [],
+                    }
             saved_at = data.get("saved_at", "?")
             online_was = sum(1 for d in devices.values() if d.get("present"))
             marker = {
@@ -774,6 +806,24 @@ class Monitor:
                 for ip, d in self.devices.items()
             }
             events_copy = list(self.events)
+        data = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "devices": devices_copy,
+            "events": events_copy,
+        }
+        tmp = self.state_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            print(f"warn: state save failed: {e}", file=sys.stderr, flush=True)
+
+    def _save_history(self):
+        """Write mac_history sidecar file. Called on graceful shutdown."""
+        if not self.history_path:
+            return
+        with self.lock:
             mac_history_copy = {
                 mac: {
                     "samples": list(h["samples"]),
@@ -783,17 +833,15 @@ class Monitor:
             }
         data = {
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "devices": devices_copy,
-            "events": events_copy,
             "mac_history": mac_history_copy,
         }
-        tmp = self.state_path + ".tmp"
+        tmp = self.history_path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-            os.replace(tmp, self.state_path)
+            os.replace(tmp, self.history_path)
         except OSError as e:
-            print(f"warn: state save failed: {e}", file=sys.stderr, flush=True)
+            print(f"warn: history save failed: {e}", file=sys.stderr, flush=True)
 
     def _emit(self, kind, ip, mac, name):
         ev = {
@@ -899,8 +947,11 @@ class Monitor:
             except Exception as e:
                 print(f"scan error: {e!r}", file=sys.stderr, flush=True)
             self.stop_event.wait(interval)
-        # Final save on graceful stop.
+        # Final saves on graceful stop. mac_history is only persisted here so the
+        # per-scan state save stays cheap; on a crash we lose chart history but
+        # not the device list / event log.
         self._save_state()
+        self._save_history()
 
     def stop(self):
         self.stop_event.set()
@@ -931,6 +982,10 @@ class Monitor:
                     current_state = "stale" if age > STALE_AFTER_SECONDS else "online"
             samples = list(h["samples"]) if h else []
             ip_changes = list(h["ip_changes"]) if h else []
+        # Trim to the last 24h window.
+        cutoff = time.time() - PING_HISTORY_WINDOW_S
+        samples = [s for s in samples if s[0] >= cutoff]
+        ip_changes = [c for c in ip_changes if c[0] >= cutoff]
         ips_seen = []
         for s in samples:
             if s[2] not in ips_seen:
@@ -945,6 +1000,7 @@ class Monitor:
             "names": names,
             "current_ip": current_ip,
             "current_state": current_state,
+            "window_seconds": PING_HISTORY_WINDOW_S,
         }
 
     def snapshot(self):
@@ -1057,8 +1113,7 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
 .modal-close:hover { color: #ff7a82; }
 .modal-meta { font-size: 11px; color: #c0c5ce; margin: 8px 0 12px; line-height: 1.6; }
 .modal-meta .label { color: #768390; display: inline-block; min-width: 90px; }
-.modal-meta .ipchip { background: #1a2129; color: #5fb3b3; padding: 1px 6px; border-radius: 3px; margin-right: 4px; font-size: 10px; }
-.modal-meta .ipchip.current { background: #5fb3b3; color: #0a0e14; }
+.modal-meta .ipchip { background: #1a2129; padding: 1px 6px; border-radius: 3px; margin-right: 4px; font-size: 10px; border: 1px solid transparent; }
 .chart-svg { background: #0d1218; display: block; border: 1px solid #232a32; border-radius: 3px; }
 .modal-section h3 { font-size: 11px; color: #fac863; text-transform: uppercase; letter-spacing: 0.5px; margin: 14px 0 6px; }
 .modal-table { font-size: 11px; max-height: 200px; overflow-y: auto; background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 6px 10px; }
@@ -1116,7 +1171,7 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
       <div class="modal-table" id="modal-ipchanges"></div>
     </div>
     <div class="modal-section">
-      <h3>Recent samples (newest last)</h3>
+      <h3>Samples (newest first) <span class="muted" id="modal-samples-count"></span></h3>
       <div class="modal-table" id="modal-samples"></div>
     </div>
   </div>
@@ -1258,7 +1313,24 @@ function fmtTsShort(ts) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
-function renderChart(samples, ipChanges) {
+// Single palette + color-builder shared by chart, chips, samples list, and IP-change rows.
+const IP_PALETTE = ['#5fb3b3','#99c794','#fac863','#c594c5','#6699cc','#ec5f67','#ab7967','#82b3ff'];
+
+function buildIpColors(data) {
+  // Deterministic by order of first appearance: walk samples first (chronological),
+  // then add anything in `ips` (e.g. current_ip with no samples yet) that's still missing.
+  const map = {};
+  let i = 0;
+  for (const s of (data.samples || [])) {
+    if (!(s[2] in map)) map[s[2]] = IP_PALETTE[(i++) % IP_PALETTE.length];
+  }
+  for (const ip of (data.ips || [])) {
+    if (ip && !(ip in map)) map[ip] = IP_PALETTE[(i++) % IP_PALETTE.length];
+  }
+  return map;
+}
+
+function renderChart(samples, ipChanges, ipColors) {
   if (!samples || samples.length === 0) {
     return '<div class="muted" style="padding:20px;">No ping samples recorded yet for this MAC.</div>';
   }
@@ -1272,29 +1344,22 @@ function renderChart(samples, ipChanges) {
   const xOf = t => padL + (t - tMin) / tRange * (W - padL - padR);
   const yOf = m => padT + (1 - m / msMax) * (H - padT - padB);
 
-  // Color samples by IP — assign each unique IP a color from a small palette.
-  const palette = ['#5fb3b3','#99c794','#fac863','#c594c5','#6699cc','#ec5f67','#ab7967','#82b3ff'];
-  const ipColor = {};
-  let colorIdx = 0;
-  samples.forEach(s => { if (!(s[2] in ipColor)) ipColor[s[2]] = palette[(colorIdx++) % palette.length]; });
-
-  // Polyline (light teal trace), then dots colored by IP so changes are visible.
   const points = samples.map(s => `${xOf(s[0]).toFixed(1)},${yOf(s[1]).toFixed(1)}`).join(' ');
   const dots = samples.map(s => {
-    const c = ipColor[s[2]];
+    const c = ipColors[s[2]] || '#5fb3b3';
     return `<circle cx="${xOf(s[0]).toFixed(1)}" cy="${yOf(s[1]).toFixed(1)}" r="1.6" fill="${c}"/>`;
   }).join('');
 
-  // Vertical dashed lines at IP changes.
+  // Vertical dashed lines at IP changes — color-match the new IP.
   const ipLines = (ipChanges || []).filter(c => c[0] >= tMin && c[0] <= tMax).map(c => {
     const xc = xOf(c[0]).toFixed(1);
+    const lineColor = ipColors[c[2]] || '#fac863';
     return `
-      <line x1="${xc}" y1="${padT}" x2="${xc}" y2="${H - padB}" stroke="#fac863" stroke-dasharray="4,3" opacity="0.85"/>
-      <text x="${xc}" y="${padT + 9}" fill="#fac863" font-size="9" text-anchor="middle">${esc(c[2])}</text>
+      <line x1="${xc}" y1="${padT}" x2="${xc}" y2="${H - padB}" stroke="${lineColor}" stroke-dasharray="4,3" opacity="0.85"/>
+      <text x="${xc}" y="${padT + 9}" fill="${lineColor}" font-size="9" text-anchor="middle">${esc(c[2])}</text>
     `;
   }).join('');
 
-  // Y-axis ticks
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => {
     const m = msMax * (1 - f);
     const yp = yOf(m).toFixed(1);
@@ -1304,7 +1369,6 @@ function renderChart(samples, ipChanges) {
     `;
   }).join('');
 
-  // X-axis ticks (5 evenly spaced).
   const xTicks = [0, 0.25, 0.5, 0.75, 1].map(f => {
     const t = tMin + tRange * f;
     const xp = xOf(t).toFixed(1);
@@ -1314,23 +1378,15 @@ function renderChart(samples, ipChanges) {
     `;
   }).join('');
 
-  // Legend (color per IP).
-  const legendItems = Object.entries(ipColor).map(([ip, c], i) => `
-    <span style="margin-right:10px;font-size:10px;color:#c0c5ce;">
-      <span style="display:inline-block;width:8px;height:8px;background:${c};border-radius:50%;margin-right:3px;vertical-align:middle;"></span>${esc(ip)}
-    </span>
-  `).join('');
-
   return `
     <svg class="chart-svg" viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">
       <rect x="${padL}" y="${padT}" width="${W - padL - padR}" height="${H - padT - padB}" fill="#0d1218"/>
       ${yTicks}
       ${xTicks}
       ${ipLines}
-      <polyline points="${points}" fill="none" stroke="#5fb3b3" stroke-width="1" opacity="0.45"/>
+      <polyline points="${points}" fill="none" stroke="#5fb3b3" stroke-width="1" opacity="0.35"/>
       ${dots}
     </svg>
-    <div style="margin-top:6px;">${legendItems}</div>
   `;
 }
 
@@ -1346,24 +1402,40 @@ async function openMacModal(mac) {
     return;
   }
   document.getElementById('modal-mac').textContent = data.mac;
-  const ipChips = data.ips.map(ip =>
-    `<span class="ipchip${ip === data.current_ip ? ' current' : ''}">${esc(ip)}</span>`
-  ).join('');
+  const ipColors = buildIpColors(data);
+  const chipFor = ip => {
+    const color = ipColors[ip] || '#5fb3b3';
+    const isCurrent = ip === data.current_ip;
+    const style = isCurrent
+      ? `color:${color};border:1px solid ${color};`
+      : `color:${color};`;
+    return `<span class="ipchip" style="${style}">${esc(ip)}${isCurrent ? ' (current)' : ''}</span>`;
+  };
+  const ipChips = data.ips.map(chipFor).join('');
+  const windowH = Math.round((data.window_seconds || 86400) / 3600);
   document.getElementById('modal-meta').innerHTML = `
     <div><span class="label">Names:</span> ${esc(data.names.join(' / ')) || '<span class="muted">—</span>'}</div>
     <div><span class="label">State:</span> ${esc(data.current_state || 'unknown')}</div>
     <div><span class="label">IPs seen:</span> ${ipChips || '<span class="muted">—</span>'}</div>
-    <div><span class="label">Samples:</span> ${data.samples.length} · IP changes: ${data.ip_changes.length}</div>
+    <div><span class="label">Samples:</span> ${data.samples.length} · IP changes: ${data.ip_changes.length} · window: last ${windowH}h</div>
   `;
-  document.getElementById('modal-chart').innerHTML = renderChart(data.samples, data.ip_changes);
+  document.getElementById('modal-chart').innerHTML = renderChart(data.samples, data.ip_changes, ipColors);
   document.getElementById('modal-ipchanges').innerHTML = data.ip_changes.length
-    ? data.ip_changes.slice().reverse().map(c =>
-        `<div class="row ipchg">${fmtTs(c[0])}  ${esc(c[1])}  →  ${esc(c[2])}</div>`
-      ).join('')
+    ? data.ip_changes.slice().reverse().map(c => {
+        const cprev = ipColors[c[1]] || '#fac863';
+        const cnew  = ipColors[c[2]] || '#fac863';
+        return `<div class="row">${fmtTs(c[0])}  <span style="color:${cprev}">${esc(c[1])}</span>  →  <span style="color:${cnew}">${esc(c[2])}</span></div>`;
+      }).join('')
     : '<div class="muted">No IP changes recorded.</div>';
-  const recent = data.samples.slice(-30);
-  document.getElementById('modal-samples').innerHTML = recent.length
-    ? recent.map(s => `<div class="row">${fmtTs(s[0])}  ${esc(s[2])}  ${s[1].toFixed(2)} ms</div>`).join('')
+  // All samples in the window, newest first, color-matched to the chart.
+  const samplesNewestFirst = data.samples.slice().reverse();
+  document.getElementById('modal-samples-count').textContent =
+    `(${samplesNewestFirst.length} samples in last ${windowH}h)`;
+  document.getElementById('modal-samples').innerHTML = samplesNewestFirst.length
+    ? samplesNewestFirst.map(s => {
+        const c = ipColors[s[2]] || '#c0c5ce';
+        return `<div class="row" style="color:${c}">${fmtTs(s[0])}  ${esc(s[2])}  ${s[1].toFixed(2)} ms</div>`;
+      }).join('')
     : '<div class="muted">no samples</div>';
   document.getElementById('modal-backdrop').classList.add('open');
 }
