@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 IS_WINDOWS = platform.system().lower() == "windows"
 LEAVE_AFTER_SECONDS = 300       # mark device as departed after this many seconds of silence
 STALE_AFTER_SECONDS = 30        # mark dot yellow if silent this long but not yet departed
+DROP_AFTER_SECONDS = 86400      # drop a device record entirely after this many seconds offline (24h)
 MAC_SAMPLE_INTERVAL_S = 30      # only append one ping sample per MAC every N seconds
 PING_HISTORY_MAXLEN = 2880      # per-MAC ping samples kept (2880 × 30s = 24h)
 PING_HISTORY_WINDOW_S = 86400   # only show samples newer than this in the chart (24h)
@@ -930,6 +931,15 @@ class Monitor:
                         d["present"] = False
                         departures.append((ip, d.get("mac"), list(d.get("names") or [])))
 
+            # Drop records that have been offline for more than DROP_AFTER_SECONDS
+            # (default 24h). The IP is no longer "in use" by us — if it ever
+            # comes back it'll be re-added cleanly as a new arrival.
+            drops = []
+            for ip, d in list(self.devices.items()):
+                if not d.get("present") and (now - d.get("last_seen", 0)) > DROP_AFTER_SECONDS:
+                    drops.append((ip, d.get("mac"), list(d.get("names") or [])))
+                    del self.devices[ip]
+
             self.scan_count += 1
             self.last_scan_duration = time.time() - start
 
@@ -937,6 +947,9 @@ class Monitor:
             self._emit("arrived", ip, mac, " / ".join(names) if names else "")
         for ip, mac, names in departures:
             self._emit("left", ip, mac, " / ".join(names) if names else "")
+        for ip, mac, names in drops:
+            label = " / ".join(names) if names else ""
+            self._emit("info", ip, mac, f"dropped (offline >24h) {label}".rstrip())
 
         self._save_state()
 
