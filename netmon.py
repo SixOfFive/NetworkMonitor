@@ -1112,13 +1112,18 @@ def main():
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(monitor))
     print(f"dashboard:  http://{args.bind}:{args.port}/", flush=True)
 
+    # ThreadingHTTPServer.shutdown() must NOT be called from the same thread
+    # that runs serve_forever() — it blocks waiting for the loop to exit and
+    # deadlocks. Spawn the shutdown so the signal handler returns immediately.
+    shutting_down = threading.Event()
+
     def shutdown(signum=None, frame=None):
+        if shutting_down.is_set():
+            return
+        shutting_down.set()
         print("\nshutting down...", flush=True)
         monitor.stop()
-        try:
-            server.shutdown()
-        except Exception:
-            pass
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)
     if not IS_WINDOWS:
