@@ -995,6 +995,10 @@ class Monitor:
                     current_state = "stale" if age > STALE_AFTER_SECONDS else "online"
             samples = list(h["samples"]) if h else []
             ip_changes = list(h["ip_changes"]) if h else []
+            events_for_mac = [
+                e for e in self.events
+                if (e.get("mac") or "").lower() == mac and e.get("ip")
+            ]
         # Trim to the last 24h window.
         cutoff = time.time() - PING_HISTORY_WINDOW_S
         samples = [s for s in samples if s[0] >= cutoff]
@@ -1003,6 +1007,13 @@ class Monitor:
         for s in samples:
             if s[2] not in ips_seen:
                 ips_seen.append(s[2])
+        # The event log is saved every scan and survives more restarts than the
+        # mac_history sidecar, so it may know about IPs we have no ping samples
+        # for. Cross-reference it so "IPs seen" reflects the full picture and
+        # the chart's color palette assigns a slot for those IPs too.
+        for ev in events_for_mac:
+            if ev["ip"] not in ips_seen:
+                ips_seen.append(ev["ip"])
         if current_ip and current_ip not in ips_seen:
             ips_seen.append(current_ip)
         return {
