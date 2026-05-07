@@ -979,12 +979,24 @@ class Monitor:
         mac = mac.strip().lower()
         with self.lock:
             h = self.mac_history.get(mac)
-            current = None
-            for d in self.devices.values():
-                if (d.get("mac") or "").lower() == mac:
-                    current = d
-                    break
-            names = list(current.get("names") or []) if current else []
+            # A MAC can have several device records (one per IP it has held over
+            # time) — pick the one that's actually current: prefer present
+            # devices over offline ones, then by most recent last_seen.
+            candidates = [
+                d for d in self.devices.values()
+                if (d.get("mac") or "").lower() == mac
+            ]
+            candidates.sort(
+                key=lambda d: (bool(d.get("present")), d.get("last_seen") or 0),
+                reverse=True,
+            )
+            current = candidates[0] if candidates else None
+            # Merge names from every device record sharing this MAC.
+            names = []
+            for d in candidates:
+                for n in (d.get("names") or []):
+                    if n not in names:
+                        names.append(n)
             current_ip = current["ip"] if current else None
             current_state = None
             if current is not None:
