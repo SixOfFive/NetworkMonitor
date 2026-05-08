@@ -1153,6 +1153,11 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
 .modal-meta .ipchip:hover { filter: brightness(1.4); }
 .modal-meta .ipchip.selected { background: rgba(255,255,255,0.08); }
 .chart-svg { background: #0d1218; display: block; border: 1px solid #232a32; border-radius: 3px; }
+.chart-svg circle.sample-dot { cursor: crosshair; }
+.chart-svg circle.sample-dot:hover { stroke: #ffffff; stroke-width: 1.5; }
+.chart-tooltip { position: fixed; display: none; background: #1a2129; border: 1px solid #2a323c; border-radius: 4px; padding: 6px 10px; font-size: 11px; pointer-events: none; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.5); white-space: nowrap; line-height: 1.4; color: #c0c5ce; }
+.chart-tooltip .tt-time { color: #768390; font-size: 10px; }
+.chart-tooltip .tt-ms { color: #c0c5ce; font-weight: 600; }
 .modal-section h3 { font-size: 11px; color: #fac863; text-transform: uppercase; letter-spacing: 0.5px; margin: 14px 0 6px; }
 .modal-table { font-size: 11px; max-height: 200px; overflow-y: auto; background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 6px 10px; }
 .modal-table .row { white-space: pre; padding: 1px 0; }
@@ -1195,6 +1200,8 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
   <h2>Events <span class="muted" id="evcount"></span></h2>
   <div id="events"></div>
 </div>
+
+<div class="chart-tooltip" id="chart-tooltip"></div>
 
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" id="modal" role="dialog" aria-modal="true">
@@ -1408,7 +1415,7 @@ function renderChart(samples, ipChanges, ipColors) {
   ).join('');
   const dots = samples.map(s => {
     const c = ipColors[s[2]] || '#5fb3b3';
-    return `<circle cx="${xOf(s[0]).toFixed(1)}" cy="${yOf(s[1]).toFixed(1)}" r="2" fill="${c}"/>`;
+    return `<circle class="sample-dot" cx="${xOf(s[0]).toFixed(1)}" cy="${yOf(s[1]).toFixed(1)}" r="2.2" fill="${c}" data-ts="${s[0]}" data-ms="${s[1]}" data-ip="${esc(s[2])}"/>`;
   }).join('');
 
   // Vertical dashed lines at IP changes — color-match the new IP.
@@ -1529,6 +1536,8 @@ function renderMacModal() {
 
 function closeMacModal() {
   document.getElementById('modal-backdrop').classList.remove('open');
+  const tt = document.getElementById('chart-tooltip');
+  if (tt) tt.style.display = 'none';
 }
 
 document.getElementById('modal-close').addEventListener('click', closeMacModal);
@@ -1536,6 +1545,56 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => {
   if (e.target.id === 'modal-backdrop') closeMacModal();
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMacModal(); });
+
+// ---------- Chart-point hover tooltip ----------
+function _tt() { return document.getElementById('chart-tooltip'); }
+
+function _positionTooltip(clientX, clientY) {
+  const tt = _tt();
+  // Default to lower-right of the cursor; flip if we'd overflow the viewport.
+  const r = tt.getBoundingClientRect();
+  let x = clientX + 14;
+  let y = clientY + 14;
+  if (x + r.width > window.innerWidth - 4)  x = clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 4) y = clientY - r.height - 14;
+  if (x < 4) x = 4;
+  if (y < 4) y = 4;
+  tt.style.left = x + 'px';
+  tt.style.top  = y + 'px';
+}
+
+document.addEventListener('mouseover', (e) => {
+  const dot = e.target.closest && e.target.closest('circle.sample-dot');
+  if (!dot) return;
+  const ts = parseFloat(dot.getAttribute('data-ts'));
+  const ms = parseFloat(dot.getAttribute('data-ms'));
+  const ip = dot.getAttribute('data-ip');
+  const colors = currentMacData ? buildIpColors(currentMacData) : {};
+  const c = colors[ip] || '#5fb3b3';
+  const tt = _tt();
+  tt.innerHTML = `
+    <div class="tt-time">${fmtTs(ts)}</div>
+    <div><span style="color:${c};font-weight:600">${esc(ip)}</span> &nbsp;<span class="tt-ms">${ms.toFixed(2)} ms</span></div>
+  `;
+  tt.style.display = 'block';
+  _positionTooltip(e.clientX, e.clientY);
+});
+
+document.addEventListener('mousemove', (e) => {
+  const tt = _tt();
+  if (tt.style.display !== 'block') return;
+  const dot = e.target.closest && e.target.closest('circle.sample-dot');
+  if (dot) _positionTooltip(e.clientX, e.clientY);
+});
+
+document.addEventListener('mouseout', (e) => {
+  const dot = e.target.closest && e.target.closest('circle.sample-dot');
+  if (!dot) return;
+  // Only hide if we're actually leaving the dot (not moving inside it).
+  const next = e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('circle.sample-dot');
+  if (next === dot) return;
+  _tt().style.display = 'none';
+});
 
 document.addEventListener('click', (e) => {
   // Don't intercept clicks on the sortable headers (already handled).
