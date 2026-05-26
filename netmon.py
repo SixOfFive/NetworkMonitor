@@ -27,6 +27,7 @@ IS_WINDOWS = platform.system().lower() == "windows"
 LEAVE_AFTER_SECONDS = 300       # mark device as departed after this many seconds of silence
 STALE_AFTER_SECONDS = 30        # mark dot yellow if silent this long but not yet departed
 DROP_AFTER_SECONDS = 86400      # drop a device record entirely after this many seconds offline (24h)
+NAME_REFRESH_INTERVAL_S = 3600  # re-resolve every name source for a known device this often (1h)
 MAC_SAMPLE_INTERVAL_S = 30      # only append one ping sample per MAC every N seconds
 PING_HISTORY_MAXLEN = 2880      # per-MAC ping samples kept (2880 × 30s = 24h)
 PING_HISTORY_WINDOW_S = 86400   # only show samples newer than this in the chart (24h)
@@ -860,28 +861,36 @@ class Monitor:
 
     def scan_once(self):
         start = time.time()
-        responding = {}  # ip -> (ms_or_None, names_list, method)
+        responding = {}  # ip -> (ms_or_None, names_list, method, did_resolve_names)
+
+        # Decide which IPs need a name lookup this scan. We look up when we
+        # don't have any name yet, OR the names haven't been refreshed in
+        # NAME_REFRESH_INTERVAL_S — so a renamed device (DHCP hostname change,
+        # iPhone rename, joined a domain, etc.) eventually shows the new name.
+        now_pre = time.time()
+        with self.lock:
+            need_names = {}
+            for ip, d in self.devices.items():
+                last = d.get("names_refreshed") or 0
+                need_names[ip] = (not d.get("names")) or (now_pre - last) > NAME_REFRESH_INTERVAL_S
 
         # Fire all probes in parallel.
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            # Skip name lookups for IPs we already have a name for; keep trying for the rest.
-            with self.lock:
-                have_name = {ip: bool(d.get("names")) for ip, d in self.devices.items()}
-            futures = [
-                ex.submit(probe_one, ip, not have_name.get(ip))
+            futures = {
+                ex.submit(probe_one, ip, need_names.get(ip, True)): ip
                 for ip in self.ips
-            ]
+            }
             for fut in as_completed(futures):
                 ip, ms, names, method = fut.result()
                 if method:
-                    responding[ip] = (ms, names, method)
+                    responding[ip] = (ms, names, method, need_names.get(ip, True))
 
         arp = get_arp_table()
         now = time.time()
         arrivals, departures = [], []
 
         with self.lock:
-            for ip, (ms, names, method) in responding.items():
+            for ip, (ms, names, method, did_resolve) in responding.items():
                 mac = arp.get(ip)
                 # Per-MAC history for the click-to-open ping chart (only ping samples).
                 if mac:
@@ -892,6 +901,7 @@ class Monitor:
                         "ip": ip,
                         "mac": mac,
                         "names": list(names),
+                        "names_refreshed": now if did_resolve else 0,
                         "first_seen": now,
                         "last_seen": now,
                         "last_recovered": now,   # treat first sighting as initial recovery
@@ -914,7 +924,18 @@ class Monitor:
                     d["last_method"] = method
                     if mac and not d.get("mac"):
                         d["mac"] = mac
-                    if names:
+                    if did_resolve:
+                        # Periodic refresh: replace the names list with whatever
+                        # the lookup just returned so renames get picked up. If
+                        # the lookup came back empty (transient DNS / mDNS hiccup),
+                        # keep the previous names so we don't flap.
+                        if names:
+                            existing = d.get("names") or []
+                            if list(existing) != list(names):
+                                d["names"] = list(names)
+                        d["names_refreshed"] = now
+                    elif names:
+                        # First-time lookup for a device with no name yet — additive.
                         existing = d.get("names") or []
                         for n in names:
                             if n not in existing:
