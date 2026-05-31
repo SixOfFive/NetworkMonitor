@@ -1426,10 +1426,11 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
 .ssh-form .checkbox-row { margin-top: 8px; color: #c0c5ce; }
 .ssh-form .checkbox-row small { color: #768390; display: block; margin-left: 20px; }
 .ssh-form .actions { margin-top: 10px; display: flex; gap: 8px; }
-.ssh-btn { background: #1a2129; color: #5fb3b3; border: 1px solid #2a4040; padding: 5px 12px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 11px; }
+.ssh-btn { background: #1a2129; color: #5fb3b3; border: 1px solid #2a4040; padding: 5px 12px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 11px; display: inline-block; text-decoration: none; }
 .ssh-btn:hover { background: #233038; }
 .ssh-btn.danger { color: #ec5f67; border-color: #4a2828; }
-.ssh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ssh-btn.launch { color: #fac863; border-color: #4a4028; }
+.ssh-btn:disabled, .ssh-btn.disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
 .ssh-output { background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 8px 10px; font-size: 11px; max-height: 280px; overflow-y: auto; white-space: pre-wrap; color: #c0c5ce; margin-top: 8px; }
 .ssh-output .heading { color: #fac863; font-weight: 600; }
 .ssh-warn { color: #fac863; font-size: 10px; margin-top: 6px; line-height: 1.4; }
@@ -1794,9 +1795,24 @@ async function renderSshSection() {
   renderSshUI(status, target, cap);
 }
 
+function puttyUrl(user, ip) {
+  // ssh://user@host — handled by PuTTY (or whatever is registered as the
+  // ssh: protocol handler on the user's machine). If no user is known yet
+  // PuTTY will prompt for it on connect.
+  if (!ip) return null;
+  return user ? `ssh://${encodeURIComponent(user)}@${ip}` : `ssh://${ip}`;
+}
+
+function puttyButton(user, ip) {
+  const url = puttyUrl(user, ip);
+  if (!url) {
+    return `<a class="ssh-btn launch disabled" title="No IP available">Open in PuTTY</a>`;
+  }
+  return `<a class="ssh-btn launch" href="${esc(url)}" title="Launches the ssh:// handler on your local machine (PuTTY, OpenSSH, etc.)">Open in PuTTY</a>`;
+}
+
 function renderSshUI(status, ip, cap) {
   const root = document.getElementById('modal-ssh');
-  const macEsc = esc(currentMacData.mac);
   const clientNote = `client: ${esc(cap.client)} (${esc(cap.path || '')})${cap.sshpass || cap.client === 'plink' ? '' : ' — password auth needs <code>sshpass</code> or <code>plink</code>'}`;
   if (status.has_creds) {
     root.innerHTML = `
@@ -1805,8 +1821,9 @@ function renderSshUI(status, ip, cap) {
         · auth: <span class="auth">${esc(status.auth)}</span>
         <span class="muted">· ${clientNote}</span>
       </div>
-      <div class="actions" style="display:flex;gap:8px;">
+      <div class="actions" style="display:flex;gap:8px;align-items:center;">
         <button class="ssh-btn" id="ssh-probe-btn">Get system info</button>
+        ${puttyButton(status.user, ip)}
         <button class="ssh-btn danger" id="ssh-forget-btn">Forget credentials</button>
       </div>
       <div class="ssh-output" id="ssh-output" style="display:none"></div>
@@ -1828,8 +1845,9 @@ function renderSshUI(status, ip, cap) {
           </label>
           <small>If successful, the password is discarded; future probes use key auth. If the install fails, the encrypted password is kept as a fallback.</small>
         </div>
-        <div class="actions">
+        <div class="actions" style="display:flex;gap:8px;align-items:center;">
           <button class="ssh-btn" id="ssh-save-btn">Save &amp; test</button>
+          ${puttyButton(null, ip)}
         </div>
         <div class="ssh-warn">
           ⚠ Stored passwords are encrypted with openssl AES-256-CBC and the key file is mode 0600 — this stops casual reads but does NOT protect against an attacker with shell access on this box. Key auth (the checkbox above) is the only path that stores no password.
