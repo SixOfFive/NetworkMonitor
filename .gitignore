@@ -10,3 +10,33 @@ venv/
 # state cache file written by netmon at runtime
 netmon-state.json
 netmon-state.json.tmp
+
+# per-MAC ping history sidecar
+netmon-state.history.json
+netmon-state.history.json.tmp
+
+# stored SSH credentials + the AES key that encrypts them
+# (NEVER commit these — they're local secrets on the netmon host)
+netmon-state.ssh-creds.json
+netmon-state.ssh-creds.json.tmp
+netmon-state.enc-key
+
+# generated SSH keypair used by netmon to log in to LAN devices
+netmon-state.ssh-key
+netmon-state.ssh-key.pub
+
+# belt-and-suspenders patterns for arbitrary --state PATH names
+*.ssh-creds.json
+*.ssh-creds.json.tmp
+*.enc-key
+*.ssh-key
+*.ssh-key.pub
+*.history.json
+*.history.json.tmp
+
+# generic key material that should never be committed
+id_rsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
