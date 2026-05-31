@@ -733,9 +733,12 @@ REMOTE_INFO_CMD = (
 def get_ssh_client():
     """Return ('plink'|'openssh', path) tuple, or None if no client is available.
 
-    plink is preferred when present because it accepts -pw for password auth
-    natively, but OpenSSH + sshpass works just as well and is what's installed
-    on the netmon Debian box by default.
+    Preference:
+      - Windows  : plink first (PuTTY is the typical install), openssh fallback.
+      - Linux    : openssh first (StrictHostKeyChecking=accept-new lets us
+                   auto-accept first-time host keys; plink's -batch refuses to
+                   and the probe just fails with 'host key not cached'), plink
+                   fallback if openssh is missing.
     """
     if IS_WINDOWS:
         for p in DEFAULT_PLINK_PATHS:
@@ -744,13 +747,16 @@ def get_ssh_client():
         ssh = shutil.which("ssh")
         if ssh:
             return ("openssh", ssh)
+        p = shutil.which("plink")
+        if p:
+            return ("plink", p)
         return None
-    p = shutil.which("plink")
-    if p:
-        return ("plink", p)
     ssh = shutil.which("ssh")
     if ssh:
         return ("openssh", ssh)
+    p = shutil.which("plink")
+    if p:
+        return ("plink", p)
     return None
 
 
@@ -877,6 +883,24 @@ def _ssh_run_cmd(ip, username, remote_cmd, *, password=None, key_path=None, time
     ]
     if kind == "plink":
         cmd = [path, "-ssh", "-batch"]
+        # plink -batch refuses to prompt for an unknown host key. Try to
+        # pre-fetch the fingerprint with ssh-keyscan and pass it via
+        # -hostkey so the first connect succeeds without interaction.
+        keyscan = shutil.which("ssh-keyscan")
+        if keyscan:
+            try:
+                ks = subprocess.run(
+                    [keyscan, "-T", "3", "-t", "ed25519,rsa,ecdsa", ip],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4,
+                )
+                # ssh-keyscan output line: "<host> <keytype> <base64key>"
+                for line in ks.stdout.decode("utf-8", errors="ignore").splitlines():
+                    parts = line.split()
+                    if len(parts) == 3 and parts[0] == ip:
+                        cmd += ["-hostkey", f"{parts[1]} {parts[2]}"]
+                        break
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         if key_path:
             cmd += ["-i", key_path]
         if password:
