@@ -40,3 +40,6 @@ id_ecdsa
 id_ed25519
 *.pem
 *.key
+*.ppk
+netmon-ssh-key.zip
+netmon.ppk

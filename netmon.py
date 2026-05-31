@@ -8,6 +8,7 @@ Example:
 """
 import argparse
 import base64
+import io
 import json
 import os
 import platform
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -907,6 +909,130 @@ def _ssh_run_cmd(ip, username, remote_cmd, *, password=None, key_path=None, time
         return "", f"ssh timed out after {timeout}s", -1
     except OSError as e:
         return "", f"ssh exec error: {e}", -1
+
+
+def get_puttygen():
+    """Path to puttygen if installed (part of putty-tools on Debian), else None."""
+    return shutil.which("puttygen")
+
+
+def install_putty_tools():
+    """apt-install putty-tools so puttygen becomes available. Linux/Debian only.
+    Requires passwordless sudo on the netmon host. Returns (ok, message)."""
+    if get_puttygen():
+        return True, "already installed"
+    if IS_WINDOWS:
+        return False, "auto-install only supported on Debian/Ubuntu"
+    if not shutil.which("apt"):
+        return False, "apt not found (only Debian/Ubuntu auto-install is supported)"
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "apt-get", "install", "-y", "putty-tools"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "apt timed out"
+    except OSError as e:
+        return False, f"apt exec error: {e}"
+    if get_puttygen():
+        return True, "installed via apt"
+    err = (proc.stderr.decode("utf-8", errors="ignore")
+           or proc.stdout.decode("utf-8", errors="ignore"))
+    return False, err.strip()[:500] or "apt returned non-zero"
+
+
+def convert_openssh_to_ppk(state_path):
+    """Convert netmon's ed25519 OpenSSH private key to PPK bytes (PuTTY format).
+    The PPK is generated on demand and never written to disk — the bytes are
+    returned to the caller and discarded after the response is sent."""
+    _, _, priv = _ssh_paths(state_path)
+    if not priv or not os.path.exists(priv):
+        raise RuntimeError("no SSH key on disk yet — save credentials with "
+                           "'install SSH key' first to generate one")
+    pg = get_puttygen()
+    if not pg:
+        raise RuntimeError("puttygen not installed (apt install putty-tools)")
+    # puttygen writes the PPK to the -o path; we use a temp file then read+unlink.
+    tmp = priv + ".ppk.tmp"
+    try:
+        proc = subprocess.run(
+            [pg, priv, "-O", "private", "-o", tmp],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode != 0 or not os.path.exists(tmp):
+            err = (proc.stderr.decode("utf-8", errors="ignore")
+                   or proc.stdout.decode("utf-8", errors="ignore"))
+            raise RuntimeError(f"puttygen failed: {err.strip()[:200]}")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# Tiny .bat that adds the bundled .ppk to Pageant (and starts Pageant if it
+# isn't already running). User just double-clicks the .bat after extracting
+# the ZIP. Once Pageant has the key, every PuTTY session — including the ones
+# launched via the dashboard's "Open in PuTTY" button — uses it automatically.
+PAGEANT_LOADER_BAT = (
+    "@echo off\r\n"
+    "REM Adds netmon.ppk to Pageant (PuTTY's key agent).\r\n"
+    "REM After this, PuTTY connections use the netmon key automatically.\r\n"
+    "set PAGEANT=\r\n"
+    'if exist "%ProgramFiles%\\PuTTY\\pageant.exe" set PAGEANT=%ProgramFiles%\\PuTTY\\pageant.exe\r\n'
+    'if exist "%ProgramFiles(x86)%\\PuTTY\\pageant.exe" set PAGEANT=%ProgramFiles(x86)%\\PuTTY\\pageant.exe\r\n'
+    'if "%PAGEANT%"=="" (\r\n'
+    '  echo Could not find pageant.exe. Install PuTTY from https://www.putty.org and try again.\r\n'
+    "  pause\r\n"
+    "  exit /b 1\r\n"
+    ")\r\n"
+    'start "" "%PAGEANT%" "%~dp0netmon.ppk"\r\n'
+    "echo netmon.ppk loaded into Pageant. PuTTY sessions will use it automatically.\r\n"
+    "exit /b 0\r\n"
+)
+
+PPK_README = (
+    "netmon SSH key bundle\r\n"
+    "=====================\r\n"
+    "\r\n"
+    "Files\r\n"
+    "  netmon.ppk            -- the PuTTY-format private key\r\n"
+    "  load-into-pageant.bat -- one-click loader; double-click to add the key\r\n"
+    "                          to Pageant (PuTTY's key agent). Pageant starts\r\n"
+    "                          automatically and runs in the system tray.\r\n"
+    "\r\n"
+    "After loading:\r\n"
+    "  Every PuTTY connection (including the dashboard's 'Open in PuTTY'\r\n"
+    "  button) authenticates with this key and skips the password prompt.\r\n"
+    "\r\n"
+    "Manual alternative:\r\n"
+    "  Right-click the Pageant tray icon -> Add Key -> select netmon.ppk.\r\n"
+    "\r\n"
+    "Security:\r\n"
+    "  netmon.ppk is a PRIVATE key. Anyone who has this file can SSH as\r\n"
+    "  netmon to every host the key was installed on. Keep it on devices\r\n"
+    "  you trust. Delete this download if you don't need it locally.\r\n"
+)
+
+
+def build_ppk_bundle(state_path):
+    """Return (zip_bytes, filename) — a zip containing netmon.ppk, a Pageant
+    loader .bat, and a short readme."""
+    ppk_bytes = convert_openssh_to_ppk(state_path)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("netmon.ppk", ppk_bytes)
+        z.writestr("load-into-pageant.bat", PAGEANT_LOADER_BAT)
+        z.writestr("README.txt", PPK_README)
+    return buf.getvalue(), "netmon-ssh-key.zip"
 
 
 def remote_install_pubkey(ip, username, password, pubkey, timeout=15):
@@ -1811,6 +1937,87 @@ function puttyButton(user, ip) {
   return `<a class="ssh-btn launch" href="${esc(url)}" title="Launches the ssh:// handler on your local machine (PuTTY, OpenSSH, etc.)">Open in PuTTY</a>`;
 }
 
+function ppkButton(cap) {
+  // Only meaningful when we have a netmon key on disk AND puttygen is present.
+  // If puttygen is missing but apt is available, swap to an Install button that
+  // hits POST /api/ssh/install-puttygen.
+  if (!cap.has_key) {
+    return `<button class="ssh-btn launch disabled" title="No SSH key generated yet — save credentials with 'install key' first">Download PuTTY key</button>`;
+  }
+  if (!cap.puttygen) {
+    if (cap.can_apt) {
+      return `<button class="ssh-btn launch" id="ssh-install-puttygen-btn" title="apt install putty-tools on the netmon host">Install puttygen</button>`;
+    }
+    return `<button class="ssh-btn launch disabled" title="puttygen not installed and can't auto-install on this host">Download PuTTY key (puttygen missing)</button>`;
+  }
+  return `<button class="ssh-btn launch" id="ssh-ppk-btn" title="Generate a PuTTY .ppk + Pageant loader .bat zip">Download PuTTY key</button>`;
+}
+
+function attachPpkHandlers(cap) {
+  const dl = document.getElementById('ssh-ppk-btn');
+  if (dl) dl.addEventListener('click', doSshDownloadPpk);
+  const ins = document.getElementById('ssh-install-puttygen-btn');
+  if (ins) ins.addEventListener('click', doSshInstallPuttygen);
+}
+
+async function doSshInstallPuttygen() {
+  const btn = document.getElementById('ssh-install-puttygen-btn');
+  btn.disabled = true;
+  setSshOutput('Running: sudo apt install -y putty-tools … (may take ~10 s)', 'wait');
+  try {
+    const r = await fetch('/api/ssh/install-puttygen', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      setSshOutput('puttygen installed. Reloading…', 'ok');
+      sshCapability = null;  // bust cache so capability is re-fetched
+      setTimeout(() => renderSshSection(), 500);
+    } else {
+      setSshOutput('Install failed: ' + esc(j.message || 'unknown'), 'err');
+    }
+  } catch (e) {
+    setSshOutput('Network error: ' + esc(String(e)), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doSshDownloadPpk() {
+  const btn = document.getElementById('ssh-ppk-btn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/ssh/ppk-bundle');
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { const j = await r.json(); if (j.error) msg = j.error; } catch (e) {}
+      setSshOutput('Error: ' + esc(msg), 'err');
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'netmon-ssh-key.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setSshOutput(
+      'Downloaded <b>netmon-ssh-key.zip</b>.\n\n' +
+      'Next steps:\n' +
+      '  1. Extract the zip somewhere local (anywhere you trust).\n' +
+      '  2. Double-click <b>load-into-pageant.bat</b> — Pageant starts in your tray with the key loaded.\n' +
+      '  3. Click <b>Open in PuTTY</b> above; it connects with the key, no password prompt.\n\n' +
+      '⚠ The .ppk is a PRIVATE key. Treat it like the encrypted credentials — keep it on a device you trust, ' +
+      'delete the download if you don\'t need it.',
+      'ok'
+    );
+  } catch (e) {
+    setSshOutput('Network error: ' + esc(String(e)), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderSshUI(status, ip, cap) {
   const root = document.getElementById('modal-ssh');
   const clientNote = `client: ${esc(cap.client)} (${esc(cap.path || '')})${cap.sshpass || cap.client === 'plink' ? '' : ' — password auth needs <code>sshpass</code> or <code>plink</code>'}`;
@@ -1821,15 +2028,17 @@ function renderSshUI(status, ip, cap) {
         · auth: <span class="auth">${esc(status.auth)}</span>
         <span class="muted">· ${clientNote}</span>
       </div>
-      <div class="actions" style="display:flex;gap:8px;align-items:center;">
+      <div class="actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <button class="ssh-btn" id="ssh-probe-btn">Get system info</button>
         ${puttyButton(status.user, ip)}
+        ${ppkButton(cap)}
         <button class="ssh-btn danger" id="ssh-forget-btn">Forget credentials</button>
       </div>
       <div class="ssh-output" id="ssh-output" style="display:none"></div>
     `;
     document.getElementById('ssh-probe-btn').addEventListener('click', () => doSshProbe(ip));
     document.getElementById('ssh-forget-btn').addEventListener('click', () => doSshForget());
+    attachPpkHandlers(cap);
   } else {
     root.innerHTML = `
       <div class="ssh-status"><span class="no-creds">No credentials stored for this MAC.</span> <span class="muted">${clientNote}</span></div>
@@ -1845,9 +2054,10 @@ function renderSshUI(status, ip, cap) {
           </label>
           <small>If successful, the password is discarded; future probes use key auth. If the install fails, the encrypted password is kept as a fallback.</small>
         </div>
-        <div class="actions" style="display:flex;gap:8px;align-items:center;">
+        <div class="actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <button class="ssh-btn" id="ssh-save-btn">Save &amp; test</button>
           ${puttyButton(null, ip)}
+          ${ppkButton(cap)}
         </div>
         <div class="ssh-warn">
           ⚠ Stored passwords are encrypted with openssl AES-256-CBC and the key file is mode 0600 — this stops casual reads but does NOT protect against an attacker with shell access on this box. Key auth (the checkbox above) is the only path that stores no password.
@@ -1856,6 +2066,7 @@ function renderSshUI(status, ip, cap) {
       </div>
     `;
     document.getElementById('ssh-save-btn').addEventListener('click', () => doSshSaveCreds(ip));
+    attachPpkHandlers(cap);
   }
 }
 
@@ -2136,14 +2347,33 @@ def make_handler(monitor):
                     self._send(200, json.dumps(snap), "application/json")
             elif self.path == "/api/ssh/capability":
                 client = get_ssh_client()
+                _, _, priv = _ssh_paths(monitor.state_path) if monitor.state_path else (None, None, None)
                 payload = {
                     "available": client is not None,
                     "client": client[0] if client else None,
                     "path": client[1] if client else None,
                     "sshpass": shutil.which("sshpass") is not None,
                     "state_writable": bool(monitor.state_path),
+                    "puttygen": get_puttygen() is not None,
+                    "has_key": bool(priv and os.path.exists(priv)),
+                    "can_apt": (not IS_WINDOWS) and shutil.which("apt") is not None,
                 }
                 self._send(200, json.dumps(payload), "application/json")
+            elif self.path == "/api/ssh/ppk-bundle":
+                # GET — generate and stream the PPK + Pageant loader bundle.
+                # PPK is built on demand and never persisted on the server.
+                try:
+                    data, fname = build_ppk_bundle(monitor.state_path)
+                except Exception as e:
+                    self._send(400, json.dumps({"error": str(e)}), "application/json")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
             elif self.path.startswith("/api/ssh/"):
                 mac, verb = self._parse_mac_path("/api/ssh/")
                 if not mac or verb != "status":
@@ -2164,6 +2394,11 @@ def make_handler(monitor):
         def do_POST(self):
             if not self.path.startswith("/api/ssh/"):
                 self._send(404, "not found", "text/plain")
+                return
+            if self.path == "/api/ssh/install-puttygen":
+                ok, msg = install_putty_tools()
+                code = 200 if ok else 500
+                self._send(code, json.dumps({"ok": ok, "message": msg}), "application/json")
                 return
             mac, verb = self._parse_mac_path("/api/ssh/")
             if not mac:
