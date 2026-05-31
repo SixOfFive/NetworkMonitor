@@ -7,10 +7,12 @@ Example:
     python netmon.py --port 8081 --start 192.168.15.1 --end 192.168.15.254
 """
 import argparse
+import base64
 import json
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -693,6 +695,236 @@ def get_arp_table():
     return table
 
 
+# ---------- SSH credential storage + remote info gathering ----------
+#
+# When a user clicks a device in the dashboard, the modal can SSH into the host
+# and pull cpu/memory/disk/temperature/uptime info. Credentials are kept in a
+# sidecar JSON file, AES-encrypted via openssl with a per-install key.
+#
+# Security note: the encryption key file sits next to the credential file on
+# the same machine. This protects against casual file reads (mode 0600, key in
+# separate file, ciphertext not greppable) but NOT against an attacker who has
+# shell access as the netmon user. The strong alternative is SSH key auth with
+# no stored password — the dashboard offers to set this up at credential save
+# time and uses key auth automatically if it succeeds.
+
+DEFAULT_PLINK_PATHS = (
+    r"C:\Program Files\PuTTY\plink.exe",
+    r"C:\Program Files (x86)\PuTTY\plink.exe",
+)
+
+REMOTE_INFO_CMD = (
+    'echo "=== uptime ==="; uptime 2>/dev/null; '
+    'echo "=== os ==="; (grep -h PRETTY_NAME /etc/os-release 2>/dev/null | head -1 | cut -d= -f2- | tr -d \'"\') || uname -a; '
+    'echo "=== kernel ==="; uname -srm; '
+    'echo "=== cpu ==="; awk -F": " \'/^model name/ {print $2; exit}\' /proc/cpuinfo 2>/dev/null; '
+    'echo "=== load ==="; cat /proc/loadavg 2>/dev/null; '
+    'echo "=== mem ==="; free -h 2>/dev/null; '
+    'echo "=== disk ==="; df -h -x tmpfs -x devtmpfs --output=source,size,used,avail,pcent,target 2>/dev/null; '
+    'echo "=== temp ==="; (sensors -A 2>/dev/null | grep -E "(Adapter|temp|Tdie|Tctl|Package|Core|Composite)" | head -20) || '
+    '(for f in /sys/class/thermal/thermal_zone*/temp; do z="${f%/temp}"; t=$(cat "$f" 2>/dev/null); n=$(cat "${z}/type" 2>/dev/null); '
+    '[ -n "$t" ] && printf "%-20s %d.%d C\n" "$n" $((t/1000)) $(((t/100)%10)); done) 2>/dev/null; '
+    'echo "=== gpu ==="; (nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null) || echo "(no nvidia-smi)"'
+)
+
+
+def get_ssh_client():
+    """Return ('plink'|'openssh', path) tuple, or None if no client is available.
+
+    plink is preferred when present because it accepts -pw for password auth
+    natively, but OpenSSH + sshpass works just as well and is what's installed
+    on the netmon Debian box by default.
+    """
+    if IS_WINDOWS:
+        for p in DEFAULT_PLINK_PATHS:
+            if os.path.exists(p):
+                return ("plink", p)
+        ssh = shutil.which("ssh")
+        if ssh:
+            return ("openssh", ssh)
+        return None
+    p = shutil.which("plink")
+    if p:
+        return ("plink", p)
+    ssh = shutil.which("ssh")
+    if ssh:
+        return ("openssh", ssh)
+    return None
+
+
+def _ssh_paths(state_path):
+    """Return (creds_file, enckey_file, sshkey_file) paths derived from state_path."""
+    if not state_path:
+        return None, None, None
+    base = state_path[:-5] if state_path.endswith(".json") else state_path
+    return base + ".ssh-creds.json", base + ".enc-key", base + ".ssh-key"
+
+
+def _read_enc_key(state_path, create=False):
+    _, enck, _ = _ssh_paths(state_path)
+    if not enck:
+        return None
+    if os.path.exists(enck):
+        with open(enck, "rb") as f:
+            return f.read()
+    if not create:
+        return None
+    key = os.urandom(32)
+    with open(enck, "wb") as f:
+        f.write(key)
+    try:
+        os.chmod(enck, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+def encrypt_secret(plaintext, state_path):
+    """AES-256-CBC encrypt with a per-install random key. Returns base64 str."""
+    key = _read_enc_key(state_path, create=True)
+    iv = os.urandom(16)
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-256-cbc", "-K", key.hex(), "-iv", iv.hex()],
+        input=plaintext.encode("utf-8"),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("openssl encrypt failed")
+    return base64.b64encode(iv + proc.stdout).decode("ascii")
+
+
+def decrypt_secret(ciphertext_b64, state_path):
+    key = _read_enc_key(state_path)
+    if key is None:
+        raise RuntimeError("no encryption key on disk")
+    raw = base64.b64decode(ciphertext_b64)
+    iv, ct = raw[:16], raw[16:]
+    proc = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-256-cbc", "-K", key.hex(), "-iv", iv.hex()],
+        input=ct, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("openssl decrypt failed")
+    return proc.stdout.decode("utf-8", errors="ignore")
+
+
+def load_ssh_creds(state_path):
+    creds_file, _, _ = _ssh_paths(state_path)
+    if not creds_file or not os.path.exists(creds_file):
+        return {}
+    try:
+        with open(creds_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("creds") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_ssh_creds(state_path, creds):
+    creds_file, _, _ = _ssh_paths(state_path)
+    if not creds_file:
+        raise RuntimeError("state cache disabled — can't store credentials")
+    tmp = creds_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"creds": creds}, f)
+    os.replace(tmp, creds_file)
+    try:
+        os.chmod(creds_file, 0o600)
+    except OSError:
+        pass
+
+
+def ensure_ssh_keypair(state_path):
+    """Generate an ed25519 keypair for netmon if missing. Returns (priv_path, pub_text)."""
+    _, _, priv = _ssh_paths(state_path)
+    if not priv:
+        raise RuntimeError("state cache disabled")
+    pub = priv + ".pub"
+    if not os.path.exists(priv):
+        if not shutil.which("ssh-keygen"):
+            raise RuntimeError("ssh-keygen not available")
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", priv,
+             "-C", "netmon@auto"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        try:
+            os.chmod(priv, 0o600)
+        except OSError:
+            pass
+    if not os.path.exists(pub):
+        raise RuntimeError("public key missing after keygen")
+    with open(pub, encoding="utf-8") as f:
+        return priv, f.read().strip()
+
+
+def _ssh_run_cmd(ip, username, remote_cmd, *, password=None, key_path=None, timeout=15):
+    """Execute remote_cmd over SSH. Returns (stdout, stderr, returncode)."""
+    client = get_ssh_client()
+    if client is None:
+        return "", "no ssh client available on netmon host", -1
+    kind, path = client
+    common_ssh_opts = [
+        "-o", "BatchMode=" + ("no" if password else "yes"),
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "LogLevel=ERROR",
+    ]
+    if kind == "plink":
+        cmd = [path, "-ssh", "-batch"]
+        if key_path:
+            cmd += ["-i", key_path]
+        if password:
+            cmd += ["-pw", password]
+        cmd += [f"{username}@{ip}", remote_cmd]
+        env = os.environ.copy()
+    else:  # openssh
+        if key_path and not password:
+            cmd = [path, "-i", key_path] + common_ssh_opts + [f"{username}@{ip}", remote_cmd]
+            env = os.environ.copy()
+        elif password:
+            sshpass = shutil.which("sshpass")
+            if not sshpass:
+                return "", "password auth requires 'sshpass' or 'plink' (neither found)", -1
+            cmd = [sshpass, "-e", path] + common_ssh_opts + [f"{username}@{ip}", remote_cmd]
+            env = os.environ.copy()
+            env["SSHPASS"] = password
+        else:
+            cmd = [path] + common_ssh_opts + [f"{username}@{ip}", remote_cmd]
+            env = os.environ.copy()
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, env=env,
+        )
+        return (proc.stdout.decode("utf-8", errors="ignore"),
+                proc.stderr.decode("utf-8", errors="ignore"),
+                proc.returncode)
+    except subprocess.TimeoutExpired:
+        return "", f"ssh timed out after {timeout}s", -1
+    except OSError as e:
+        return "", f"ssh exec error: {e}", -1
+
+
+def remote_install_pubkey(ip, username, password, pubkey, timeout=15):
+    """Append our public key to ~/.ssh/authorized_keys on the target host."""
+    # Use a shell heredoc-equivalent: append only if not present.
+    safe_key = pubkey.replace("'", "'\"'\"'")
+    install_cmd = (
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+        f"grep -qxF '{safe_key}' ~/.ssh/authorized_keys 2>/dev/null || "
+        f"echo '{safe_key}' >> ~/.ssh/authorized_keys && "
+        "chmod 600 ~/.ssh/authorized_keys && echo OK"
+    )
+    out, err, rc = _ssh_run_cmd(ip, username, install_cmd, password=password, timeout=timeout)
+    if rc == 0 and "OK" in out:
+        return True, None
+    return False, (err or out or "unknown error").strip()[:500]
+
+
 # ---------- monitor state ----------
 
 class Monitor:
@@ -1183,6 +1415,24 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
 .modal-table { font-size: 11px; max-height: 200px; overflow-y: auto; background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 6px 10px; }
 .modal-table .row { white-space: pre; padding: 1px 0; }
 .modal-table .ipchg { color: #fac863; }
+.ssh-status { font-size: 11px; color: #c0c5ce; margin-bottom: 8px; }
+.ssh-status .auth { color: #99c794; }
+.ssh-status .no-creds { color: #fac863; }
+.ssh-status .err { color: #ec5f67; }
+.ssh-form { background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 10px 12px; font-size: 11px; }
+.ssh-form label { display: block; color: #768390; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin: 6px 0 2px; }
+.ssh-form input[type=text], .ssh-form input[type=password] { width: 240px; background: #0a0e14; color: #c0c5ce; border: 1px solid #2a323c; border-radius: 3px; padding: 4px 6px; font-family: inherit; font-size: 11px; }
+.ssh-form input[type=checkbox] { vertical-align: middle; margin-right: 4px; }
+.ssh-form .checkbox-row { margin-top: 8px; color: #c0c5ce; }
+.ssh-form .checkbox-row small { color: #768390; display: block; margin-left: 20px; }
+.ssh-form .actions { margin-top: 10px; display: flex; gap: 8px; }
+.ssh-btn { background: #1a2129; color: #5fb3b3; border: 1px solid #2a4040; padding: 5px 12px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 11px; }
+.ssh-btn:hover { background: #233038; }
+.ssh-btn.danger { color: #ec5f67; border-color: #4a2828; }
+.ssh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ssh-output { background: #0d1218; border: 1px solid #232a32; border-radius: 3px; padding: 8px 10px; font-size: 11px; max-height: 280px; overflow-y: auto; white-space: pre-wrap; color: #c0c5ce; margin-top: 8px; }
+.ssh-output .heading { color: #fac863; font-weight: 600; }
+.ssh-warn { color: #fac863; font-size: 10px; margin-top: 6px; line-height: 1.4; }
 #events { background: #0d1218; border: 1px solid #232a32; border-radius: 4px; height: 250px; overflow-y: auto; padding: 6px 10px; font-size: 11px; }
 .ev { padding: 1px 0; white-space: pre; }
 .ev.arrived { color: #99c794; }
@@ -1239,6 +1489,10 @@ tr[data-mac]:hover td { background: #1d2630 !important; }
     <div class="modal-section">
       <h3>Samples (newest first) <span class="muted" id="modal-samples-count"></span></h3>
       <div class="modal-table" id="modal-samples"></div>
+    </div>
+    <div class="modal-section" id="modal-ssh-section" style="display:none">
+      <h3>SSH access</h3>
+      <div id="modal-ssh"></div>
     </div>
   </div>
 </div>
@@ -1483,6 +1737,18 @@ function renderChart(samples, ipChanges, ipColors) {
 // when set, narrows the chart / IP-changes / samples list to that one IP.
 let currentMacData = null;
 let selectedIp = null;
+let sshCapability = null;   // cached /api/ssh/capability response
+
+async function fetchSshCapability() {
+  if (sshCapability !== null) return sshCapability;
+  try {
+    const r = await fetch('/api/ssh/capability');
+    sshCapability = await r.json();
+  } catch (e) {
+    sshCapability = { available: false };
+  }
+  return sshCapability;
+}
 
 async function openMacModal(mac) {
   if (!mac) return;
@@ -1499,6 +1765,157 @@ async function openMacModal(mac) {
   selectedIp = null;
   renderMacModal();
   document.getElementById('modal-backdrop').classList.add('open');
+  // Render the SSH section after the rest of the modal is on screen so the
+  // capability fetch doesn't block the visible render.
+  renderSshSection().catch(e => console.error(e));
+}
+
+async function renderSshSection() {
+  const cap = await fetchSshCapability();
+  const section = document.getElementById('modal-ssh-section');
+  if (!cap.available) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  if (!cap.state_writable) {
+    document.getElementById('modal-ssh').innerHTML =
+      '<div class="ssh-status err">State cache is disabled (--state \'\') so credentials cannot be stored.</div>';
+    return;
+  }
+  const mac = currentMacData.mac;
+  let status;
+  try {
+    const r = await fetch('/api/ssh/' + encodeURIComponent(mac) + '/status');
+    status = await r.json();
+  } catch (e) {
+    document.getElementById('modal-ssh').innerHTML =
+      '<div class="ssh-status err">Could not load SSH status.</div>';
+    return;
+  }
+  const target = currentMacData.current_ip || (currentMacData.ips && currentMacData.ips[0]) || '';
+  renderSshUI(status, target, cap);
+}
+
+function renderSshUI(status, ip, cap) {
+  const root = document.getElementById('modal-ssh');
+  const macEsc = esc(currentMacData.mac);
+  const clientNote = `client: ${esc(cap.client)} (${esc(cap.path || '')})${cap.sshpass || cap.client === 'plink' ? '' : ' — password auth needs <code>sshpass</code> or <code>plink</code>'}`;
+  if (status.has_creds) {
+    root.innerHTML = `
+      <div class="ssh-status">
+        Stored credentials: <span class="auth">${esc(status.user)}@${esc(ip || '?')}</span>
+        · auth: <span class="auth">${esc(status.auth)}</span>
+        <span class="muted">· ${clientNote}</span>
+      </div>
+      <div class="actions" style="display:flex;gap:8px;">
+        <button class="ssh-btn" id="ssh-probe-btn">Get system info</button>
+        <button class="ssh-btn danger" id="ssh-forget-btn">Forget credentials</button>
+      </div>
+      <div class="ssh-output" id="ssh-output" style="display:none"></div>
+    `;
+    document.getElementById('ssh-probe-btn').addEventListener('click', () => doSshProbe(ip));
+    document.getElementById('ssh-forget-btn').addEventListener('click', () => doSshForget());
+  } else {
+    root.innerHTML = `
+      <div class="ssh-status"><span class="no-creds">No credentials stored for this MAC.</span> <span class="muted">${clientNote}</span></div>
+      <div class="ssh-form">
+        <label>Username</label>
+        <input type="text" id="ssh-user" autocomplete="off">
+        <label>Password</label>
+        <input type="password" id="ssh-pw" autocomplete="new-password">
+        <div class="checkbox-row">
+          <label style="display:inline;text-transform:none;letter-spacing:normal;font-size:11px;color:#c0c5ce;">
+            <input type="checkbox" id="ssh-install-key" checked>
+            Generate and install an SSH key on this host (recommended)
+          </label>
+          <small>If successful, the password is discarded; future probes use key auth. If the install fails, the encrypted password is kept as a fallback.</small>
+        </div>
+        <div class="actions">
+          <button class="ssh-btn" id="ssh-save-btn">Save &amp; test</button>
+        </div>
+        <div class="ssh-warn">
+          ⚠ Stored passwords are encrypted with openssl AES-256-CBC and the key file is mode 0600 — this stops casual reads but does NOT protect against an attacker with shell access on this box. Key auth (the checkbox above) is the only path that stores no password.
+        </div>
+        <div class="ssh-output" id="ssh-output" style="display:none"></div>
+      </div>
+    `;
+    document.getElementById('ssh-save-btn').addEventListener('click', () => doSshSaveCreds(ip));
+  }
+}
+
+function setSshOutput(html, mode) {
+  const el = document.getElementById('ssh-output');
+  if (!el) return;
+  el.style.display = 'block';
+  el.innerHTML = html;
+  if (mode === 'err') el.style.color = '#ec5f67';
+  else if (mode === 'ok') el.style.color = '#c0c5ce';
+  else el.style.color = '#fac863';
+}
+
+async function doSshSaveCreds(ip) {
+  const user = document.getElementById('ssh-user').value.trim();
+  const pw = document.getElementById('ssh-pw').value;
+  const installKey = document.getElementById('ssh-install-key').checked;
+  if (!user || !pw) { setSshOutput('Username and password are required.', 'err'); return; }
+  setSshOutput(installKey ? 'Saving credentials and installing SSH key…' : 'Saving credentials…', 'wait');
+  const btn = document.getElementById('ssh-save-btn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/ssh/' + encodeURIComponent(currentMacData.mac) + '/creds', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user, password: pw, install_key: installKey, ip }),
+    });
+    const j = await r.json();
+    if (!r.ok || j.error) {
+      setSshOutput('Error: ' + esc(j.error || ('HTTP ' + r.status)), 'err');
+    } else {
+      const msg = j.auth === 'key'
+        ? 'Saved. SSH key installed on the host — future probes use key auth, no password kept.'
+        : 'Saved with encrypted password.' + (j.key_error ? ' (Key install failed: ' + esc(j.key_error) + ')' : '');
+      setSshOutput(msg, 'ok');
+      // Re-render so the UI flips to the "Get system info" view.
+      setTimeout(() => renderSshSection(), 600);
+    }
+  } catch (e) {
+    setSshOutput('Network error: ' + esc(String(e)), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doSshForget() {
+  if (!confirm('Forget SSH credentials for ' + currentMacData.mac + '?')) return;
+  await fetch('/api/ssh/' + encodeURIComponent(currentMacData.mac) + '/forget', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+  });
+  renderSshSection();
+}
+
+async function doSshProbe(ip) {
+  setSshOutput('Connecting to ' + esc(ip) + '…', 'wait');
+  const btn = document.getElementById('ssh-probe-btn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/ssh/' + encodeURIComponent(currentMacData.mac) + '/probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ip }),
+    });
+    const j = await r.json();
+    if (!r.ok || j.error) {
+      setSshOutput('Error: ' + esc(j.error || ('HTTP ' + r.status)), 'err');
+    } else if (!j.ok) {
+      setSshOutput('SSH failed (rc=' + j.returncode + '):\n' + esc(j.stderr || j.stdout || ''), 'err');
+    } else {
+      // Highlight section headers ("=== uptime ===" etc.)
+      const formatted = esc(j.stdout).replace(/^=== ([^=]+) ===$/gm, '<span class="heading">=== $1 ===</span>');
+      setSshOutput(formatted, 'ok');
+    }
+  } catch (e) {
+    setSshOutput('Network error: ' + esc(String(e)), 'err');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderMacModal() {
@@ -1660,6 +2077,30 @@ def make_handler(monitor):
             self.end_headers()
             self.wfile.write(data)
 
+        def _read_body(self):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            if n <= 0:
+                return {}
+            raw = self.rfile.read(n)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return {}
+
+        def _parse_mac_path(self, prefix):
+            """Extract the MAC from a path like /api/ssh/<mac>/<verb>. Returns (mac, verb)."""
+            raw = self.path[len(prefix):]
+            raw = raw.split("?", 1)[0]
+            parts = [p for p in raw.split("/") if p]
+            if not parts:
+                return None, None
+            mac = urllib.parse.unquote(parts[0]).strip().lower()
+            verb = parts[1] if len(parts) > 1 else ""
+            return mac, verb
+
         def do_GET(self):
             if self.path == "/" or self.path.startswith("/index"):
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
@@ -1668,7 +2109,6 @@ def make_handler(monitor):
                 self._send(200, payload, "application/json")
             elif self.path.startswith("/api/mac/"):
                 raw = self.path[len("/api/mac/"):]
-                # strip query string if present
                 raw = raw.split("?", 1)[0]
                 mac = urllib.parse.unquote(raw)
                 snap = monitor.mac_snapshot(mac)
@@ -1676,6 +2116,140 @@ def make_handler(monitor):
                     self._send(404, "no such mac", "text/plain")
                 else:
                     self._send(200, json.dumps(snap), "application/json")
+            elif self.path == "/api/ssh/capability":
+                client = get_ssh_client()
+                payload = {
+                    "available": client is not None,
+                    "client": client[0] if client else None,
+                    "path": client[1] if client else None,
+                    "sshpass": shutil.which("sshpass") is not None,
+                    "state_writable": bool(monitor.state_path),
+                }
+                self._send(200, json.dumps(payload), "application/json")
+            elif self.path.startswith("/api/ssh/"):
+                mac, verb = self._parse_mac_path("/api/ssh/")
+                if not mac or verb != "status":
+                    self._send(404, "not found", "text/plain")
+                    return
+                creds = load_ssh_creds(monitor.state_path)
+                e = creds.get(mac)
+                payload = {
+                    "mac": mac,
+                    "has_creds": bool(e),
+                    "user": (e or {}).get("user") if e else None,
+                    "auth": "key" if (e and e.get("use_key")) else ("password" if e else None),
+                }
+                self._send(200, json.dumps(payload), "application/json")
+            else:
+                self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            if not self.path.startswith("/api/ssh/"):
+                self._send(404, "not found", "text/plain")
+                return
+            mac, verb = self._parse_mac_path("/api/ssh/")
+            if not mac:
+                self._send(400, "missing mac", "text/plain")
+                return
+            body = self._read_body()
+            if verb == "creds":
+                user = (body.get("user") or "").strip()
+                password = body.get("password") or ""
+                install_key = bool(body.get("install_key"))
+                ip = (body.get("ip") or "").strip()
+                if not user:
+                    self._send(400, json.dumps({"error": "username required"}), "application/json")
+                    return
+                if not monitor.state_path:
+                    self._send(400, json.dumps({
+                        "error": "state cache is disabled (--state ''); credential storage requires it"
+                    }), "application/json")
+                    return
+                entry = {"user": user}
+                key_installed = False
+                key_error = None
+                if install_key:
+                    if not ip:
+                        self._send(400, json.dumps({"error": "ip required to install key"}), "application/json")
+                        return
+                    try:
+                        _, pubkey = ensure_ssh_keypair(monitor.state_path)
+                    except Exception as e:
+                        self._send(500, json.dumps({"error": f"keygen failed: {e}"}), "application/json")
+                        return
+                    ok, err = remote_install_pubkey(ip, user, password, pubkey)
+                    key_installed = ok
+                    key_error = err
+                if key_installed:
+                    entry["use_key"] = True
+                else:
+                    # Fall back to (or stay on) stored password.
+                    if not password:
+                        self._send(400, json.dumps({"error": "password required when not using key auth"}), "application/json")
+                        return
+                    try:
+                        entry["password_enc"] = encrypt_secret(password, monitor.state_path)
+                    except Exception as e:
+                        self._send(500, json.dumps({"error": f"encrypt failed: {e}"}), "application/json")
+                        return
+                creds = load_ssh_creds(monitor.state_path)
+                creds[mac] = entry
+                try:
+                    save_ssh_creds(monitor.state_path, creds)
+                except Exception as e:
+                    self._send(500, json.dumps({"error": f"save failed: {e}"}), "application/json")
+                    return
+                self._send(200, json.dumps({
+                    "ok": True,
+                    "auth": "key" if entry.get("use_key") else "password",
+                    "key_installed": key_installed,
+                    "key_error": key_error,
+                }), "application/json")
+            elif verb == "forget":
+                creds = load_ssh_creds(monitor.state_path)
+                creds.pop(mac, None)
+                try:
+                    save_ssh_creds(monitor.state_path, creds)
+                except Exception as e:
+                    self._send(500, json.dumps({"error": f"save failed: {e}"}), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True}), "application/json")
+            elif verb == "probe":
+                ip = (body.get("ip") or "").strip()
+                if not ip:
+                    self._send(400, json.dumps({"error": "ip required"}), "application/json")
+                    return
+                creds = load_ssh_creds(monitor.state_path)
+                e = creds.get(mac)
+                if not e:
+                    self._send(400, json.dumps({"error": "no credentials stored for this MAC"}), "application/json")
+                    return
+                user = e.get("user")
+                priv_path = None
+                password = None
+                if e.get("use_key"):
+                    try:
+                        priv_path, _ = ensure_ssh_keypair(monitor.state_path)
+                    except Exception as ex:
+                        self._send(500, json.dumps({"error": f"key missing: {ex}"}), "application/json")
+                        return
+                else:
+                    try:
+                        password = decrypt_secret(e["password_enc"], monitor.state_path)
+                    except Exception as ex:
+                        self._send(500, json.dumps({"error": f"decrypt failed: {ex}"}), "application/json")
+                        return
+                out, err, rc = _ssh_run_cmd(
+                    ip, user, REMOTE_INFO_CMD,
+                    password=password, key_path=priv_path, timeout=12,
+                )
+                self._send(200, json.dumps({
+                    "ok": rc == 0,
+                    "returncode": rc,
+                    "stdout": out,
+                    "stderr": err,
+                    "auth": "key" if e.get("use_key") else "password",
+                }), "application/json")
             else:
                 self._send(404, "not found", "text/plain")
 
